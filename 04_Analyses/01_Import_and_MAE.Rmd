@@ -1,0 +1,258 @@
+---
+title: "01_Import_and_MAE"
+author: "Dupret Florent"
+date: "`r Sys.Date()`"
+output:
+  html_document: 
+    df_print: kable
+    theme: yeti
+    highlight: tango
+    toc: yes
+    toc_depth: 4
+    toc_float: yes
+    number_sections: yes
+    code_folding: show
+editor_options: 
+  chunk_output_type: console
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, fig.show='hold', cache = FALSE, results = 'hold', warning = FALSE, message = FALSE, error = FALSE)
+#Cleaning rstudio
+rm(list = ls())
+#Libraries required
+require(ggplot2)
+require(tidyverse)
+require(FactoMineR)
+require(readr)
+require(SummarizedExperiment)
+require(MultiAssayExperiment)
+```
+
+# Data preparation
+
+Data preparation was done in R studio (version XXX) and involves importing the raw datafiles, selecting the information of interest and organizing it into a central structured object.
+
+The first step was to import the datafiles \textit{mae\_7\_with\_MC.Rds},  \textit{Gates\_metabolomics\_batch\_accounting.csv},  \textit{gates\_metabolomics\_022420\_stanford.csv} and  \textit{gates\_metabolomics\_061219\_UMD.csv} and to rename them \emph{res}, \emph{batch}, \emph{stan} and \emph{umd} respectively. Since the data originates from a larger research project than my master’s thesis, we already know a lot about it and what it contains. Therefore, with my promoter, we were able to identify relevant pieces of data for my project, omitting to consider other pieces. In that sense, some of the following procedures might be a based on given instructions or prior information and need no justification. The \emph{res} and \emph{batch} file both contain sample relevant data which would be combined into the same column data object. \emph{res} also contained a SummarizedExperiment object with the RNA count data for the vaginal microbiota composition of both UMD and Stanford cohort members. Finally, objects \emph{stan} and \emph{umd} contained the metabolomic data of Stanford and UMD respectively.
+
+After importing the files, the batch data was rectified: the sample ID column was shortened, and a new column combining the cohort and the batch components into a single string of characters was created. This was the first element of the column data. The second element was contained in the \emph{res} \emph{MultiAssayExperiment} (MAE) object. From this file, the following variables of interest to this project were selected: \emph{SampleID, Subject, Status, Cohort, Race, BMI, Age, GestationalAge\_days, Bleeding, PH, cycle\_nb, cycle\_nb\_m, cycle\_length, cycleday, MC\_ok} and \emph{Reprod\_status}. After combining the variables with the batch data into a new dataframe called \emph{coldata}, this newly created object was separated according to cohort: one column data objet for Stanford, called \emph{MB\_stan\_col} and one for UMD, called \emph{MB\_umd\_col}.
+
+The metabolomics datasets were tackled next: the row relevant metadata was isolated from the main metabolomic peak intensity data and renamed \emph{MB\_stan\_row} and \emph{MB\_umd\_row} accordingly. Two extra rows from the Stanford metabolomics data were discarded as they did not contain any data (completely empty rows). These main data tables, renamed \emph{MB\_stan\_assay} and \emph{MB\_umd\_assay}, were isolated from the rest. Then, the assay data, row and column metadata were collected into a \emph{SummarizedExperiment} object called \emph{MB\_stan} and \emph{MB\_umd} accordingly. The row names and column names were also corrected for ease of manipulation.
+
+As a second-to-last step, the gene count data was prepared: only the variables of interest were selected in the column data. It was then separated according to cohort allocation into the object \emph{VM\_stan} and \emph{VM\_umd}.
+
+Finally, two MultiAssayExperiment objects were created: one for Stanford cohort and the other for UMD. They both comprised the microbiota composition data (gene counts - \emph{VM\_stan} or \emph{VM\_umd}) and metabolite data (peak intensities - \emph{MB\_stan} or \emph{MB\_umd}) with their respective row and column metadata element. These MAE objects will be the central data source for the subsequent data preprocessing steps and analyses.
+
+```{r}
+res <- readRDS(file= "../03_Data/mae_7_with_MC.Rds")
+#Extracting the VMRC dataset
+VMRC <- res@ExperimentList$VM16S_VMRC_ASVseq
+```
+
+```{r}
+#Preparation of the "BATCH" dataset
+#Import batch dataset
+batch <- read_csv("../03_Data/Gates_metabolomics_batch_accounting.csv")
+#Rectify SampleID column and combining Cohort+Batch
+batch <- batch %>%
+  mutate(SampleID = UID %>%
+           str_remove_all(" [0-9]*$") %>%
+           str_replace_all(" ","_"),
+         Batch = Metabolomics_batch,
+         Cluster = paste(Cohort, Metabolomics_batch)) %>%
+  select(SampleID, Batch, Cluster)
+#Ordering batch according to sampleId
+batch <- arrange(batch, SampleID)
+```
+
+```{r, eval = FALSE, echo = FALSE}
+#METABOLITE PREPARATION
+#Import MB datasets
+stan <- read_csv(file = "../03_Data/gates_metabolomics_022420_stanford.csv")
+umd <- read_csv(file = "../03_Data/gates_metabolomics_061219_UMD.csv")
+#Identifying dissimilarities between umd and stan datasets
+odd <- stan$BIOCHEMICAL[stan$BIOCHEMICAL != umd$BIOCHEMICAL]
+#Correcting differences
+summary(t(stan[odd,6:ncol(stan)]))
+stan <- stan[-which(stan$BIOCHEMICAL %in% odd),]
+#Creating respective SummarizedExperiment objects
+MB_stan <- SummarizedExperiment(assay = stan[6:ncol(stan)], rowData = stan[1:5])
+MB_umd <- SummarizedExperiment(assay = umd[6:ncol(umd)], rowData = umd[1:5])
+#Adapting Stanford column names
+MB_stan <- MB_stan[,sort(MB_stan@colData@rownames)]
+#Adapting UMD column names
+colnames(MB_umd) <- colnames(MB_umd) %>% str_remove_all("[0-9]*$") %>% str_trim(side = "right") %>% str_replace_all(" ","_")
+MB_umd <- MB_umd[,sort(MB_umd@colData@rownames)]
+#Adapting Stanford row names
+rownames(MB_stan) <- stan$BIOCHEMICAL
+#Adapting UMD row names
+rownames(MB_umd) <- umd$BIOCHEMICAL
+```
+```{r}
+#METABOLITE PREPARATION
+#Import MB datasets
+stan <- read_csv(file = "../03_Data/gates_metabolomics_022420_stanford.csv")
+umd <- read_csv(file = "../03_Data/gates_metabolomics_061219_UMD.csv")
+
+#Identifying dissimilarities between umd and stan datasets
+odd <- stan$BIOCHEMICAL[stan$BIOCHEMICAL != umd$BIOCHEMICAL]
+#Correcting differences
+summary(t(stan[odd,6:ncol(stan)]))
+stan <- stan[-which(stan$BIOCHEMICAL %in% odd),]
+
+#Creating rowData based on the first 5 columns of Metabolomic dataset
+MB_stan_row <- stan[1:5]
+MB_umd_row <- umd[1:5]
+
+#Creating assay based on the columns of Metabolomic dataset (200 columns)
+MB_stan_assay <- stan[6:ncol(stan)]
+MB_umd_assay <- umd[6:ncol(umd)]
+
+#Adapting Stanford column names
+MB_stan_assay <- MB_stan_assay[,sort(colnames(MB_stan_assay))]
+#Adapting UMD column names
+colnames(MB_umd_assay) <- colnames(MB_umd_assay) %>% str_remove_all("[0-9]*$") %>% str_trim(side = "right") %>% str_replace_all(" ","_")
+MB_umd_assay <- MB_umd_assay[,sort(colnames(MB_umd_assay))]
+
+#Adapting Stanford row names
+rownames(MB_stan_assay) <- stan$BIOCHEMICAL
+#Adapting UMD row names
+rownames(MB_umd_assay) <- umd$BIOCHEMICAL
+```
+
+```{r, eval = FALSE, echo = FALSE}
+#COLUMN DATA PREPARATION
+#Create 
+coldata <- colData(res)
+#Selecting columns
+ColsOfInterest <- c("SampleID", "Subject", "Status", "Cohort", "Race", "BMI", "Age", "GestationalAge_days", "Bleeding", "PH", "cycle_nb", "cycle_nb_m", "cycle_length", "cycleday", "MC_ok", "Reprod_status")
+coldata <- coldata[,ColsOfInterest]
+#Filtering rows
+coldata <- coldata[coldata$SampleID %in% batch$SampleID,]
+#Sorting coldata by SampleID
+coldata <- arrange(data.frame(coldata), SampleID)
+#Combining batch data and coldata
+coldata <- left_join(coldata, batch, by = "SampleID")
+#Separating coldata according to Pregnant (Stanford) and Non-pregnant (UMD) status
+coldata.stan <- coldata[coldata$Status == "Pregnant",]
+coldata.umd <- coldata[coldata$Status == "Non-pregnant",]
+```
+```{r}
+#COLUMN DATA PREPARATION
+#Create 
+coldata <- colData(res)
+#Selecting columns
+ColsOfInterest <- c("SampleID", "Subject", "Status", "Cohort", "Race", "BMI", "Age", "GestationalAge_days", "Bleeding", "PH", "cycle_nb", "cycle_nb_m", "cycle_length", "cycleday", "MC_ok", "Reprod_status")
+coldata <- coldata[,ColsOfInterest]
+
+#Filtering rows
+coldata <- coldata[coldata$SampleID %in% batch$SampleID,]
+
+#Sorting coldata by SampleID
+coldata <- arrange(data.frame(coldata), SampleID)
+
+#Combining batch data and coldata
+coldata <- left_join(coldata, batch, by = "SampleID")
+
+#Setting rownames of coldata as SampleID
+rownames(coldata) <- coldata$SampleID
+
+#Separating coldata according to Pregnant (Stanford) and Non-pregnant (UMD) status
+MB_stan_col <- coldata[coldata$Status == "Pregnant",]
+MB_umd_col <- coldata[coldata$Status == "Non-pregnant",]
+```
+
+```{r}
+#METABOLOMIC SUMMARIZEDEXPERIMENT OBJECT
+MB_stan <- SummarizedExperiment(assay = MB_stan_assay,
+                                rowData = MB_stan_row,
+                                colData = MB_stan_col)
+MB_umd <- SummarizedExperiment(assay = MB_umd_assay,
+                               rowData = MB_umd_row,
+                               colData = MB_umd_col)
+```
+
+```{r, eval = FALSE, echo = FALSE}
+#Selecting relevant variables in VMRC
+colData(VMRC) <- colData(VMRC)[c("SampleID", "BarcodeSequence", "Platform", "NumberInRun", "AmpDNAconc", "SampleSum")]
+#Missing colnames
+mis.colnames <- coldata[!coldata$SampleID %in% colnames(VMRC),]$SampleID
+#Creating Gap Filler
+GapFiller <- matrix(nrow = nrow(VMRC), ncol = 7,
+                    dimnames = list(rownames(VMRC),mis.colnames))
+GapFiller.coldata <- matrix(nrow = 7, ncol = ncol(colData(VMRC)),
+                            dimnames = list(mis.colnames ,colnames(colData(VMRC))))
+#Combining column data
+coldata.VMRC <- rbind(colData(VMRC), data.frame(GapFiller.coldata))
+#Combining assay data
+assay.VMRC <- cbind(assay(VMRC), GapFiller)
+#Recreating the VMRC SummarizedExperiment from scratch
+VMRC <- SummarizedExperiment(assays = assay.VMRC,
+                             rowData = rowData(VMRC),
+                             colData = coldata.VMRC)
+#Sorting SE according to colnames (sample ID)
+VMRC <- VMRC[,sort(colnames(VMRC))]
+#Separating VMRC according to Stanford and UMD patient ID
+VM_stan <- VMRC[,VMRC@colData@rownames %in% colnames(MB_stan)]
+VM_umd <- VMRC[,VMRC@colData@rownames %in% colnames(MB_umd)]
+```
+```{r}
+#Selecting relevant variables in VMRC
+VMRC_col <- colData(VMRC)[c("SampleID", "BarcodeSequence", "Platform", "NumberInRun", "AmpDNAconc", "SampleSum")]
+#Adding batch variable to column data
+VMRC_col <- left_join(x = data.frame(VMRC_col), y = batch, by = "SampleID")
+
+#Assay data
+VMRC_assay <- assay(VMRC)
+#Row data
+VMRC_row <- rowData(VMRC)
+
+#Recreating the VMRC SummarizedExperiment from scratch
+VMRC <- SummarizedExperiment(assays = VMRC_assay,
+                             rowData = VMRC_row,
+                             colData = VMRC_col)
+#Sorting SE according to colnames (sample ID)
+VMRC <- VMRC[ ,sort(colnames(VMRC))]
+#Separating VMRC according to Stanford and UMD patient ID
+VM_stan <- VMRC[,VMRC@colData@rownames %in% colnames(MB_stan)]
+VM_umd <- VMRC[,VMRC@colData@rownames %in% colnames(MB_umd)]
+```
+
+```{r}
+#Creating assay list
+assay_list_stan <- list(MB = MB_stan,
+                        VM = VM_stan)
+assay_list_umd <- list(MB = MB_umd,
+                       VM = VM_umd)
+#Creating MultiAssayExperiment
+STANFORD <- MultiAssayExperiment(experiments = ExperimentList(assay_list_stan))
+UMD <- MultiAssayExperiment(experiments = ExperimentList(assay_list_umd))
+```
+
+The end-products of this preparation section are summarized below:
+
+```{r, results='markup'}
+#Checking results
+STANFORD
+UMD
+```
+
+
+* `MB` = pre-processed peak intensities of metabolites samples measured using semi-targeted mass spectrometry (MS). This SummarizedExperiment has contains an assay with `r ncol(STANFORD@ExperimentList$MB)` columns and `r nrow(STANFORD@ExperimentList$MB)` rows in Stanford, and `r ncol(UMD@ExperimentList$MB)` columns and `r nrow(UMD@ExperimentList$MB)` rows in UMD There are approximately 5 samples from 40 pregnant women in Stanford and 5 samples from 40 non-pregnant women in UMD. 
+
+  - Its `rowData` has `r nrow(rowData(STANFORD[["MB"]]))` columns (for both Stanford and Umd) expressing the name of the biochemicals / metabolites, the super-pathway to which they are part of, the sub-pathway to which they are part of, the compound's mass and its KEGG identification code.
+
+  - The `colData` with batch related information (batch, sample ID, cohort) and clinical data for each cohort member like gestational age, age, BMI, vaginal pH, cycle day, etc., for a total of `r ncol(colData(STANFORD[["MB"]]))` variables in Stanford and `r ncol(colData(UMD[["MB"]]))` variables in UMD.
+
+* `VM` = 16S rRNA sequence counts of `r nrow(STANFORD@ExperimentList$VM)` (`r nrow(UMD@ExperimentList$VM)`) identified bacterial strands from the vaginal ecosystem of Stanford patients (UMD patients respectively). These counts come from `r ncol(STANFORD@ExperimentList$VM)` (`r ncol(UMD@ExperimentList$VM)`) samples of the same 40 pregnant women in Stanford (or the same 40 non-pregnant women in UMD).
+
+  - This object also contains row data of dimension `r dim(STANFORD@ExperimentList$VM@elementMetadata)` in Stanford and `r dim(UMD@ExperimentList$VM@elementMetadata)` in UMD
+  - It also contains its specific column data of dimension `r dim(STANFORD@ExperimentList$VM@colData)` (`r dim(UMD@ExperimentList$VM@colData)`) with information specific to the RNASeq measurements (like the library size) and batch allocation
+
+It is easy to understand the dimensions of the metabolite (MB) object or the vaginal microbiota (VM) are the same in both Stanford and UMD.
+
+```{r}
+#Saving results
+saveRDS(STANFORD, file = "../05_Results/STANFORD_mae.Rds")
+saveRDS(UMD, file = "../05_Results/UMD_mae.Rds")
+```

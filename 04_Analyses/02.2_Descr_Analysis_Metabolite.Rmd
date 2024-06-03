@@ -1,0 +1,1729 @@
+---
+title: "02.2_Descr_Analysis_Metabolite"
+author: "Dupret Florent"
+date: "`r Sys.Date()`"
+output:
+  html_document: 
+    df_print: kable
+    theme: yeti
+    highlight: tango
+    toc: yes
+    toc_depth: 4
+    toc_float: yes
+    number_sections: yes
+    fig_caption: yes
+    code_folding: hide
+editor_options: 
+  chunk_output_type: console
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, fig.show='hold', cache = F, results = 'hold', warning = F, error = F, message = F)
+#Cleaning rstudio
+rm(list = ls())
+#Libraries required
+require(ggplot2)
+require(tidyverse)
+require(FactoMineR)
+require(factoextra)
+require(visdat)
+require(readr)
+require(patchwork)
+require(limma)
+require(SummarizedExperiment)
+require(MultiAssayExperiment)
+require(pander)
+library(nipals)
+library(magrittr)
+require(sva)
+```
+```{r, include=FALSE}
+#Importing personal functions
+fs::dir_map(path = "../04_Analyses/Desc_functions", 
+            fun = source)
+#Ggplot theme
+theme_set(theme_minimal())
+#Colors for Cohort and Batch
+CohCol <- c("#F8766D", "#00BFC4") #Ggplot default binary colors
+names(CohCol) = c("Stanford", "UMD")
+BatchColors = c("firebrick", "#FEB7AA")
+#c("hotpink","darkorange2")
+names(BatchColors) = c("Batch1", "Batch2")
+```
+
+Understanding what's inside a dataset and how one could transform it to obtain a clean and practical object is one of the first steps of analyzing data. In this section, we focus on the descriptive analysis and pre-processing of the metabolite datasets. As mentioned in a previous section, the goal of the preprocessing of metabolite data is to remove any undesired effects and keep the within and between women data variability. For that to, we need to identify the effects, if they exist, and then develop an adapted solution to remove them
+
+Let us import the main MultiAssayExperiment object and work our way through all the important aspects of its content.
+
+```{r}
+#Import
+STAN <- readRDS("../05_Results/VM_STANFORD_mae.Rds")
+UMD <- readRDS("../05_Results/VM_UMD_mae.Rds")
+```
+
+## Missing values
+
+The first element we could consider are missing values. Easily enough, when reading the datafile, missing values were automatically labeled with `NA`. In that case, we can visualize and quantify the amount of missing data.
+
+```{r MissingGridOutput, out.width='50%'}
+MissingGrid(df = data.frame(t(assay(STAN[["MB"]]))), 
+            decreasing = TRUE, cohort = "Stanford")
+MissingGrid(df = data.frame(t(assay(UMD[["MB"]]))), 
+            decreasing = TRUE, cohort = "UMD")
+```
+
+As we can see in the previous figure \@ref(fig:MissingGridOutput), both Stanford and UMD datasets contain many missing values: 52% in Stanford and 56% in UMD. It is in our interest to understand how these missing values were generated and how we should handle them.
+
+Researchers have already been studying missing patterns. Three categories of patterns have emerged from their findings: missing completely at random (MCAR), missing at random (MAR), and missing not at random (MNAR). In MCAR data, missingness is independent of observed and unobserved data. In MAR, missingness is related to observed data but independent of unobserved data. In MNAR, missingness is related to unobserved data. *Mack C, Su Z, Westreich D. Managing Missing Data in Patient Registries: Addendum to Registries for Evaluating Patient Outcomes: A User’s Guide, Third Edition [Internet]. Rockville (MD): Agency for Healthcare Research and Quality (US); 2018 Feb. Types of Missing Data. Available from: https://www.ncbi.nlm.nih.gov/books/NBK493614/*
+
+From the previous graph, we can see some metabolites have more missing values than others. If there is a pattern, then it could be visualized by plotting the proportion of missing values from Stanford as a function of the proportion of missing values from UMD per metabolite. If missingness is independent of metabolite, then datapoints will be spread homogenously throughout the graph. If there is a link, then a correlation can be computed.
+
+```{r MissMissPlot}
+#Temporary dataframe
+temp <- 
+  data.frame(UMD = rowMeans(is.na(assay(UMD))),
+             STAN = rowMeans(is.na(assay(STAN))))
+#Graph
+temp |>
+  ggplot()+
+  aes(x = UMD, y = STAN)+
+  geom_point(alpha = 0.7)+
+  labs(x = "% of missing data in UMD",
+       y = "% of missing data in Stanford",
+       subtitle = paste("each dot is a metabolite; Spearman correlation coefficient of ", 
+                        round(cor(x = temp$UMD, 
+                                  y = temp$STAN, 
+                                  method = "spearman"),3)),
+       title = "Percentage of missing metabolites in each dataset")
+```
+
+This graph and the correlation coefficient between the proportion of missing metabolites in both UMD and Stanford dataset confirms the missingness is not completely random. If it were random, the data points would be scattered randomly over the frame. However, since a majority of metabolites are more or less missing in both Stanford and UMD datasets, it is an indicator of trend. Probably, the missing metabolites were in low quantity and couldn't be detected by the spectrometer.
+
+Calibration of a spectrometer will determine an LLOD or LLOQ: lower limit of detection / quantification. The fact there were an LLOD during measuring can be deduced from plotting the mean biochemicals abundance, or in this case the mean metabolite peak intensity, as a function of the proportion of missing values across sample.
+
+```{r MissMeanPlot}
+#Creating separate data
+temp <- 
+  rbind(
+  tibble(Set = "STANFORD",
+         mean = rowMeans(log10(assay(STAN)), na.rm = TRUE),
+         f_missing = rowMeans(is.na(log10(assay(STAN))))),
+  tibble(Set = "UMD",
+         mean = rowMeans(log10(assay(UMD)), na.rm = TRUE),
+         f_missing = rowMeans(is.na(log10(assay(UMD)))))
+  )
+#Plotting mean vs f_missing
+temp |> 
+  ggplot()+
+  aes(x = 100* f_missing, y = mean, col = Set)+
+  geom_point() +
+  geom_smooth(method = "lm", se = T, alpha = 0.7)+
+  facet_wrap(facets = vars(Set))+
+  labs(x = "% of samples in which a metabolite is missing",
+       y = "Mean log10(abundance of metabolites)",
+       title = "The frequency of missing data is correlated with the mean abundance", subtitle = paste("each dot is a metabolite"))+
+  theme(legend.position = "")
+```
+```{r}
+#Computing correlation coefficient between mean and f_missing
+corr.test <- 
+  temp |>
+  na.omit() |>
+  group_by(Set) |>
+  summarize(est = cor.test(x = mean, y = f_missing, 
+                           method = "spearman",
+                           alternative = "two.sided")$estimate,
+            pval = cor.test(x = mean, y = f_missing, 
+                            method = "spearman",
+                            alternative = "two.sided")$p.value)
+```
+
+There is a negative correlation between the mean abundance of the metabolites and proportion of samples in which a metabolite is missing in both UMD and Stanford datasets (Spearman correlation coefficient of `r corr.test$est[2]` and `r corr.test$est[1]` respectively). Therefore, we can conclude the missingness is linked to the biological abundance of the metabolites: the more abundant a metabolite is, the likelier it is to be detected by the spectrometer, the more probable to have a reading. Therefore, missing data is not random and depends on the unobserved LLOD.
+
+One way to deal with most of these missing values is to filter out undesired biochemicals. If we were to keep only the metabolites for which the proportion of missing values is greater than a threshold, say \\emph{25%} for instance, then we would keep only the ones for which we have more information regarding their potential missingness pattern. Now this suggestion is not as proposterous as one would think. Because the variability across samples is vast, as we will see in the next section, we know for a fact that some vaginal swabs were poorly collected or stored, thus resulting in samples of low quality and low biological material quantity. These samples are more likely to contain missing values, like we saw in figure \@ref(fig:MissMissPlot). Instead of desperately trying to find the best imputation method for these largely missing portions of the data, we get rid of them. If we had imputed these portions, we would potentially create an unwanted effect that will influence the end results. Implicitely, we select the 'best' fragment of the samples and increase our chances to find a relevant biomarker or biomarkers.
+
+Nonetheless, we note that by initiating this filtering process, we could possibly omit a rare discovery. There might be important metabolites of naturally low concentration that we will discard and never know how meaningful they are.
+
+We have to keep in mind that the example of the 25% threshold value for proportion of missingness for a given metabolite is more or less arbitrary. Only past experience and a 'sense' of the data has led us to this value. However, as discussed previously, 25% might not be too stringent nor restrictive.
+
+Fortunately, another investigator could work with the same data and choose another threshold value, or come up with different imputation methods. This investigator would likely find different and new discoveries.
+
+```{r}
+#Filter threshold
+thresh <- 0.15
+#Filtering metabolites
+data.stan <- STAN@ExperimentList$MB[rowMeans(is.na(assay(STAN[["MB"]]))) <= thresh,]
+data.umd <- UMD@ExperimentList$MB[rowMeans(is.na(assay(UMD[["MB"]]))) <= thresh,]
+```
+
+Concretely speaking, we opted for preserving all metabolites with less than `r thresh*100`% of missing values. By doing so, we restrict our dataset to `r nrow(data.stan)` biochemicals for Stanford and `r nrow(data.umd)` for UMD. From this filtering process, there is a `r mean(rownames(data.stan) %in% rownames(data.umd))*100` percent match between the selected metabolites (i.e. the percent match being the number of matching metabolites of the smallest dataset - Stanford in this case - we find in the largest dataset - UMD in this case -).
+
+If we compute the mean abundance of these compounds per sample and plot them on the y-axis, versus the proportion of missing values per sample, we obtain:
+
+```{r}
+temp <- 
+  rbind(
+  tibble(Set = "STANFORD",
+         mean = colMeans(assay(data.stan), na.rm = T),
+         f_missing = colMeans(is.na(assay(data.stan)))),
+  tibble(Set = "UMD",
+         mean = colMeans(assay(data.umd), na.rm = T),
+         f_missing = colMeans(is.na(assay(data.umd))))
+  )
+temp |>
+  ggplot()+
+  aes(y = mean, x = f_missing, col = Set) +
+  geom_point()+ scale_y_log10()+
+  geom_vline(xintercept = 0.5, 
+             linetype = "dashed", color = "grey")+
+  facet_wrap(facets = vars(Set))+
+  labs(x = "% of missing values per sample", 
+       y = "log10(mean Intensity of \n 'most common' metabolites)", 
+       subtitle = "each dot is a sample")+
+  theme(legend.position = "")
+
+#Computing spearman correlation coefficients
+corr.test <- 
+  temp |>
+  group_by(Set) |>
+  summarize(est = cor.test(x = mean, y = f_missing, 
+                           method = "spearman",
+                           alternative = "two.sided")$estimate,
+            pval = cor.test(x = mean, y = f_missing, 
+                            method = "spearman",
+                            alternative = "two.sided")$p.value)
+```
+
+There is a strong negative correlation (Spearman \rho = `r corr.test$est[1]` and `r corr.test$est[2]` for Stanford and UMD respectively) between the proportion of missing values in a sample and the mean abundance of the `r nrow(data.stan)` and `r nrow(data.umd)` 'most common' metabolites in Stanford and UMD datasets respectively (remember, the 'most common' metabolites refer to metabolites with less than `r thresh*100`% of missing values).
+
+But the previous graphs also show some samples still have more than 50% of missing data in Stanford cohort. Thus, an additional filtering must take place where samples with more than 50% of missing values are discarded from the analysis.
+
+```{r}
+#Filter thresh
+thresh.sample <- 0.5
+#Filtering metabolites
+data.stan <- data.stan[,colMeans(is.na(assay(data.stan))) < thresh.sample]
+data.umd <- data.umd[,colMeans(is.na(assay(data.umd))) < thresh.sample]
+```
+```{r}
+temp <- 
+  rbind(
+  tibble(Set = "STANFORD",
+         mean = colMeans(assay(data.stan), na.rm = T),
+         f_missing = colMeans(is.na(assay(data.stan)))),
+  tibble(Set = "UMD",
+         mean = colMeans(assay(data.umd), na.rm = T),
+         f_missing = colMeans(is.na(assay(data.umd))))
+  )
+temp |>
+  ggplot()+
+  aes(y = mean, x = f_missing, col = Set) +
+  geom_point()+ scale_y_log10()+
+  geom_vline(xintercept = 0.5, 
+             linetype = "dashed", color = "grey")+
+  facet_wrap(facets = vars(Set))+
+  labs(x = "% of missing values per sample", 
+       y = "log10(mean Intensity of \n 'most common' metabolites)", 
+       subtitle = "each dot is a sample")+
+  theme(legend.position = "")
+```
+
+As a result, both Stanford and UMD datasets contain metabolites with less than 25% missing information and samples with less than 50% missing information and the correlation between the mean metabolite intensity and the proportion of missing values per sample is represented in the table below:
+
+```{r}
+#Computing spearman correlation coefficients
+corr.test <- 
+  temp |>
+  group_by(Set) |>
+  summarize(Estimate = cor.test(x = mean, y = f_missing, 
+                           method = "spearman",
+                           alternative = "two.sided")$estimate,
+            Pvalue = cor.test(x = mean, y = f_missing, 
+                            method = "spearman",
+                            alternative = "two.sided")$p.value)
+#Presenting table
+corr.test |> pander(caption = "Spearman's correlation coefficient estimate and pvalue between mean metabolite intensity and proportion of missing values in each cohort")
+```
+
+Combining this information with the results from the previous graphs, we conclude that some samples are of "lower quality" (inferred from the number of missing values), likely because they contained lower amounts of biological material. This problem of low-quality samples may affect the rest of our analysis as we might be unable to distinguish between potential biological reasons for lower metabolite concentrations and technical reasons (swabbing quality, sample preservation, etc.). To investigate whether biological factors may be driving these differences in overall concentrations, we will next perform a series of exploratory analyses to estimate the correlation with available biological covariates (microbiota composition, menstrual cycle phase, etc.). If no correlation is found, we will assume, for the rest of this analysis, that sample quality is primarily driven by technical processes, not biological ones. Based on these results, we will then transform and impute the data accordingly.
+
+```{r}
+#Saving the filtered SummarizedExperiment to MAE object for both cohorts
+STAN <- c(STAN, MB_filtered = data.stan)
+UMD <- c(UMD, MB_filtered = data.umd)
+```
+
+
+### Exploring correlation between peak intensities and biological covariates
+
+As we have access to data like menstrual cycle phase, gestational age, BMI, Age, pH... we can draw many graphs, explore potential correlations, and discuss each of them.
+
+Another important variable to check in our case is the proportion of Lactobacillus species throughout the samples. Indeed, one might argue that the concentration of metabolites (and thus the amount of missing values) in a sample is correlated to the composition of the vaginal microbiota, especially the presence of characteristically dominant *Lactobacillus spp.*. This particular bacterial genus is known to be in high concentration in the vagina. Health experts argue a Lactobacillus-dominated vaginal microbiota is a healthy microbiota. A correlation between mean metabolite peak intensity and *Lactobacillus* proportion would indicate that Lactobacillus have a heavy influence on the metabolic profile of a person. This correlation is not necessarily very suprising: lactobacilli are known for their lactic acid production, which is a metabolite. Even though association between metabolite abundance and microbiota composition is the main object of the analysis, we can still inspect part of it in the descriptive analysis as a control to steer us in the right direction.
+
+```{r}
+#Computing proportion of Lactobacillus and adding it to colData
+##Stanford
+pl <- ComputePropBact(MAE = STAN, pattern = "Lactobacillus")
+
+d1 <- data.frame(SampleID = STAN[["MB_filtered"]]$SampleID)
+d2 <- data.frame(SampleID = names(pl), Prop_Lacto = pl)
+
+join <- left_join(d1, d2, by = "SampleID")
+
+colData(STAN[["MB_filtered"]]) <- cbind(colData(STAN[["MB_filtered"]]),
+                                        Prop_Lacto = join$Prop_Lacto)
+
+##########################################
+##UMD
+pl <- ComputePropBact(MAE = UMD, pattern = "Lactobacillus")
+
+d1 <- data.frame(SampleID = UMD[["MB_filtered"]]$SampleID)
+d2 <- data.frame(SampleID = names(pl), Prop_Lacto = pl)
+
+join <- left_join(d1, d2, by = "SampleID")
+
+#Prop_Lacto <- pl[names(pl) %in% UMD[["MB_filtered"]]$SampleID]
+colData(UMD[["MB_filtered"]]) <- cbind(colData(UMD[["MB_filtered"]]),
+                                        Prop_Lacto = join$Prop_Lacto)
+
+#removing useless objects
+rm(pl, d1, d2, join, data.stan, data.umd, corr.test, temp, thresh, thresh.sample)
+```
+```{r}
+temp <- 
+  rbind(
+  data.frame(Set = "Stanford", 
+             colData(STAN[["MB_filtered"]]),
+             Mean = colMeans(assay(STAN[["MB_filtered"]]), na.rm = TRUE)),
+  data.frame(Set = "UMD", 
+             colData(UMD[["MB_filtered"]]),
+             Mean = colMeans(assay(UMD[["MB_filtered"]]), na.rm = TRUE))) |>
+  select(Set, BMI, Age, GestationalAge_days, PH, cycle_nb,
+         cycle_length, cycleday, Reprod_status, Prop_Lacto, 
+         Mean)
+```
+
+
+```{r}
+# AGE
+temp |>
+  ggplot()+
+  aes(x = Age, y = Mean, col = Set)+
+  geom_point()+ scale_y_log10()+
+  geom_smooth(method = "lm", se = T, linetype = "dotted")+
+  facet_wrap(facets = vars(Set))+
+  labs(x = "Age", y = "log10(Mean metabolite Intensity per sample)")+
+  theme(legend.position = "")
+```
+
+```{r}
+# BMI
+p1 <- 
+  temp |> 
+  ggplot()+
+  aes(x = BMI, y = Mean, col = Set)+
+  geom_point()+ scale_y_log10()+
+  geom_smooth(method = "lm", se = T, linetype = "dotted")+
+  labs(x = "BMI", y = "log10(Mean metabolite Intensity per sample)")
+
+# Cycle_length
+p2 <- 
+  temp |> 
+  ggplot()+
+  aes(x = cycle_length, y = Mean, col = Set)+
+  geom_point()+ scale_y_log10()+
+  geom_smooth(method = "lm", se = T, linetype = "dotted")+
+  labs(x = "cycle length (in days)", y = element_blank())+
+  theme(axis.text.y = element_blank())
+#
+(p1+p2)+ plot_layout(guides = "collect") & theme(legend.position = "bottom")
+
+# GestationalAge
+p1 <- 
+  temp |> 
+  ggplot()+
+  aes(x = GestationalAge_days, y = Mean, col = Set)+
+  geom_point()+ scale_y_log10()+
+  geom_smooth(method = "lm", se = T, linetype = "dotted")+
+  labs(x = "Gestational age (in days)", y = "log10(Mean metabolite Intensity per sample)")
+# Cycle_day
+p2 <- 
+  temp |> 
+  ggplot()+
+  aes(x = cycleday, y = Mean, col = Set)+
+  geom_point()+ scale_y_log10()+
+  geom_smooth(method = "lm", se = T, linetype = "dotted")+
+  labs(x = "cycle day", y = element_blank())+
+  theme(axis.text.y = element_blank())
+#
+(p1+p2)+ plot_layout(guides = "collect") & theme(legend.position = "bottom")
+```
+
+```{r}
+# pH
+temp |> 
+  ggplot()+
+  aes(x = PH, y = Mean, col = Set)+
+  geom_point()+ scale_y_log10()+
+  geom_smooth(method = "lm", se = T, linetype = "dotted")+
+  labs(x = "pH", y = "log10(Mean metabolite Intensity per sample)")+
+  theme(legend.position = "bottom")
+
+# Reproductive status
+temp |> 
+  ggplot()+
+  aes(x = Reprod_status, y = Mean, col = Set)+
+  geom_jitter(width = 0.2)+ geom_boxplot(alpha = 0.2)+
+  scale_y_log10()+
+  labs(x = "Reproductive status", y = "log10(Mean metabolite Intensity per sample)")+
+  theme(legend.position = "right",
+        axis.text.x = element_text(angle = 45, vjust = 0.6))
+
+# Cycle_nb
+temp |> 
+  ggplot()+
+  aes(x = cycle_nb, y = Mean, col = Set, group = cycle_nb)+
+  geom_jitter(width = 0.2)+ geom_boxplot(alpha = 0.2)+
+  scale_y_log10()+
+  labs(x = "cycle number", y = "log10(Mean metabolite Intensity per sample)")+
+  theme(legend.position = "bottom")
+```
+
+```{r}
+#Lactobacillus abundance according to diversity
+temp |> 
+  ggplot()+
+  aes(x = Prop_Lacto, y = Mean, col = Set)+
+  geom_point()+ scale_y_log10()+
+  geom_smooth(method = "lm", se = T, linetype = "dotted")+
+  facet_wrap(facets = vars(Set))+
+  labs(x = "Proportion of Lactobacillus spp.", y = "log10(Mean metabolite Intensity per sample)")+
+  theme(legend.position = "")
+```
+
+In conclusion to these graph, there are no obvious confounding factors visually speaking: only small trends appear in the age and the gestational age. There is also a slight positive trend in the Stanford data but not too great. Let us support these claims with Spearman's correlation test, see table \ref(CorrelationTable).
+
+```{r, message = FALSE, fig.cap="CorrelationCoefTables"}
+#Estimating correlation coefficient and testing it 
+CorTable <- 
+  temp |>
+  select(-c(Reprod_status, cycle_nb)) |>
+  pivot_longer(cols = -c(Set, Mean), 
+               names_to = "Variable", values_to = "Values") |>
+  group_by(Set, Variable) |>
+  na.omit() |>
+  summarize(estimate = cor.test(x = Values, y = Mean,
+                                method = "spearman")$estimate,
+            pvalue = cor.test(x = Values, y = Mean,
+                              method = "spearman")$p.value)
+#Anova tests for categorical variables
+anova <- 
+  temp |>
+  select(Set, Mean, Reprod_status, cycle_nb) |>
+  filter(Set == "UMD") |>
+  aov(formula = Mean ~ Reprod_status + cycle_nb) |>
+  summary()
+
+#Presentation correlation table in a wide format
+CorTable |>
+  pivot_wider(names_from = Set, 
+              values_from = c(estimate, pvalue)) |> 
+  setNames(nm = c(" ", 
+                  "Estimate\n Stanford", "Estimate\n UMD",
+                  "Pvalue\n Stanford", "Pvalue\n UMD")) |>
+  pander(missing = " ", keep.line.breaks = TRUE, caption = "Spearman's correlation coefficient and associated p-value between the mean intensity of metabolites and the different characteristics")
+
+anova |>
+  pander(missing = " ", caption = "UMD cohort only; one-way ANOVA test between mean metabolite intensity and categorical variables 'Reprod_status' and 'cycle_nb'")
+```
+
+The biggest Spearman correlation coefficient in figure \@ref(tab: CorrelationCoefTable), in absolute value, is 0.27 and corresponds to the trend of Lactobacillus proportion we have already identified. This suggests a low positive correlation between the mean intensity of metabolites and proportion of *Lactobacillus spp.* in the Stanford cohort. In addition, the correlation between mean intensity and age in Stanford, and correlation between mean and pH in UMD are significantly (almost significantly) different than 0. In this case, one needs to control for these effects or to interpret results cautiously.
+
+**Imputation**
+
+As a last step in this section, one could eliminate the remaining missing values by means of imputation. _Imputation_ is the substitution of missing data by plausible values, had they been observed. Different imputation methods exist, some more complicated than others, some more efficient. When imputing data, there is a risk of creating effects that would never exist. Thus, one always needs to be cautious as no perfect imputation is possible. However, from learning data structure and missing pattern (MCAR, MAR, MNAR), one can choose or adapt a more appropriate imputation method.
+
+From what we have learned in the previous section, the missingness patterns seems to rely on unobserved information such as LLOD. Moreover, some individual attributes, such as age, are correlated with the mean metabolite abundance in a given sample, and play a role in the probability of a metabolite to be in higher concentration than the LLOD. From these two fundamental observations, we are already better equiped at implementing a potential imputation method. Nonetheless, a key element still needs to be adressed: the metabolite distribution.
+
+Data distribution is described and discussed in the next section and might help us optimize the imputation process.
+
+### Lactate vs Lactobacillus
+
+As a control for Lactobacillus effect, one can check the intensity of lactate metabolite for each sample according to proportion of Lactobacillus. Since this genus is well-known for its lactate production, one expects a positive correlation between these two variables.
+
+```{r}
+#Adding lactate intensity
+temp2 <- 
+  cbind(temp,
+        LactateInt = c(unlist(MetaboIntensity(assay = assay(STAN[["MB_filtered"]]), pattern = "^lactate")),
+                       unlist(MetaboIntensity(assay = assay(UMD[["MB_filtered"]]), "^lactate")))
+      )
+#Graph
+temp2 |> 
+  ggplot()+
+  aes(x = Prop_Lacto, y = LactateInt, col = Set)+
+  geom_point()+
+  geom_smooth(method = "lm", se = T, linetype = "dotted")+
+  facet_wrap(facets = vars(Set))+
+  labs(x = "Proportion of Lactobacillus spp.",
+       y = "log10(lactate peak intensity)")+
+  theme(legend.position = "")
+#Correlation
+temp2 |>
+  group_by(Set) |>
+  summarize(Estimate = cor.test(x = Prop_Lacto, y = LactateInt,
+                                method = "spearman")$estimate,
+            Pvalue = cor.test(x = Prop_Lacto, y = LactateInt,
+                              method = "spearman")$p.value) |>
+  pander(caption = "Correlation test between proportion of Lactobacillus and lactate intensity per sample")
+```
+
+The control shows a significant positive correlation (see table) between proportion of lactobacillus and lactate. Therefore, one can trust in the potential effect of lactobacilli proportion.
+
+```{r}
+rm(p1, p2, temp, temp2, CorTable)
+```
+
+## Variable distribution
+
+### Variance decomposition
+
+In the previous section part of the missing data pattern was analysed, resulting in filtering out of metabolites with more than 25% of missing values and samples with more than 50% missing values. We have also analysed correlations between mean metabolite abundance and sample attributes such as age and BMI.
+
+The remaining missing values in the datasets could potentially be imputed to plausible values. But first, we need to understand the distribution of the data.
+
+Indeed, peak intensities from mass spectrometry measurements do not automatically share the much desired property of identical distribution. Hence, it is necessary to study the transformation which could standardize metabolite distribution.
+
+Since a random variable's distribution is usually characterized by its mean and variance, it makes to study both of these elements for metabolites. On the one hand, the mean signal intensity of two different metabolites can differ grealty: such differences could reflect the true biological concentration of these biochemicals. In this case, a transformation may not necessarily involve centralising the data to a common value. On the other hand, the variance of peak intensities is not as easily interpreted. Peak signal variability has different sources as we've already mentioned before. Let us recall the most predominant ones:
+
+-   Between individuals variability (or biological variability): two individuals do not have the same vaginal concentration of lactate for example. Nonetheless, the desire to rescale the data comes from the assumption that one expects the metabolite concentration to be *similar* (but not identical) across samples.
+
+-   Within individual variability: part of this variance in peak intensities comes from the repeated samples of the same individual. Indeed, 5 samples of 80 women have been drawn over a period of time. For example, one does not expect the concentration of lactate to be exactly the same at 3 or 30 weeks pregnant.
+
+-   Quality sample variability: naturally, the variance of signal intensities could be correlated to the quality of the sample. And sample quality depends on sampling process, storage of samples, sample manipulation, etc. But since some metabolites have already been filtered in regard to this quality, the sample effect should be rather small, balanced or inexistant.
+
+-   Batch variability: in the Stanford cohort, the samples have been quantified in two different batches. And because it is simply impossible to operate and quantify a large series of samples in the exact same way at two different time periods, there is probably a batch effect. However, this batch effect will be dealt with in another section.
+
+### Boxplots
+
+For now, understanding distribution dissimilarities and finding an efficient data transformation method involving variance reduction is the main focus. The most frequent variance stabilizing transformations are applying either the logarithmic scale or the hyperbolic arcsine scale.
+
+To do so, we first transpose our dataframes so the metabolites are ordered in columns and samples in rows. Then, we plot a boxplot of the filtered 'raw' data (unchanged / unscaled), a boxplot of the log-transformed data and a boxplot for the hyperbolic arcsine-scaled data.
+
+Preceding these boxplots, a visualisation of the missing data is used for verification purposes.
+
+```{r, out.width='50%'}
+#Transposing Stanford dataframe
+t.stan <- Transposer(se = STAN[["MB_filtered"]])
+rownames(t.stan) <- colnames(STAN[["MB_filtered"]])
+#Visualisation
+vis_dat(t.stan)+labs(title = "Stanford", y = "Samples", x = "Metabolites")+
+  theme(axis.text.x = element_blank())
+#Transposing Stanford dataframe
+t.umd <- Transposer(se = UMD[["MB_filtered"]])
+rownames(t.umd) <- colnames(UMD[["MB_filtered"]])
+#Visualisation
+vis_dat(t.umd)+labs(title = "UMD", y = "Samples", x = "Metabolites")+ 
+  theme(axis.text.x = element_blank())+
+  scale_fill_manual(values = "#00BFC4")
+```
+
+```{r, out.width = '50%'}
+theme_set(theme_minimal())
+Boxplot.distr(df = t.stan, transformation = "none", cohort = "Stanford")
+Boxplot.distr(df = t.umd, transformation = "none", cohort = "UMD")
+Boxplot.distr(df = t.stan, transformation = "asinh", cohort = "Stanford")
+Boxplot.distr(df = t.umd, transformation = "asinh", cohort = "UMD")
+Boxplot.distr(df = t.stan, transformation = "log10", cohort = "Stanford")
+Boxplot.distr(df = t.umd, transformation = "log10", cohort = "UMD")
+```
+
+The log10-transformed peak intensities allow for variance stabilization, which is a good sign. The asinh scale is also beneficial in terms of variance. This log10-transformation is actually very popular in metabolomics and other disciplines. It is particularly adequate in this case as spectrometers usually use the inverse of the $log_{10}$ (i.e. the $f(x)=10^{x}$ function) during measurements. This finding is in agreement with the data collection process of Metabolon' spectrometry which uses the log scale in the measuring procedure of the samples <https://www.metabolon.com/resources/webinars/client-data-table/>.
+
+```{r, cache=FALSE}
+pval.stan <- c()
+pval.umd <- c()
+for(i in 1:ncol(t.stan)){
+  pval.stan[i] <- shapiro.test(log10(t.stan[,i]))$p.value
+}
+for(i in 1:ncol(t.umd)){
+  pval.umd[i] <-  shapiro.test(log10(t.umd[,i]))$p.value
+}
+p1 <- sum(p.adjust(pval.stan, method = "BH") > 0.05)
+p2 <- sum(p.adjust(pval.umd, method = "BH") > 0.05)
+```
+
+After log10-transforming the metabolites' distribution, using Benjamini-Hochberg correction method, there are `r p1` unsignificant Shapiro-Wilk's normal tests out of `r length(pval.stan)` for Stanford, and `r p2` out of `r length(pval.umd)` for UMD. It means there is approximately `r round(p1/length(pval.stan)*100,2)` percent tests for which we cannot reject the null hypothesis of normality (i.e. $H_0: \text{'Vector comes from a normal distribution'}$ and $H_1: \text{'Vector does NOT come from a normal distibution'}$) for Stanford, and `r round(p2/length(pval.umd)*100,2)` percent for UMD. If normality was a goal in this analysis, we could not say the log10 transformation really help in normalizing the data.
+
+### Mean-variance plots
+
+An important aspect of distribution one must consider is the relationship between mean and variance. In the case of metabolomics, it is better to have no relationship, for easier interpretation purposes. If on the contrary the variance of the peak intensity fluctuates with the mean level, then subsequent interpretation would be biased. For this reason, one could draw a mean-variance plot - a plot with the variance of each column-vector as a function of the column-vector's mean - and would expect the variance of metabolites to be centered around a horizontal line regardless of their respective mean. In practice, one could use the log10 of both axis for better visualization.
+
+The idea behind these graphs is to find the best scaling or best transformation for the data so the mean-variance relationship is close to 0. In the litterature, "scaling" and "transformation" might mean different things. The scaling is the division of the features by a feature-specific _scaling factor_. However, the transformation is usually a mathematical formula that is applied to each cell of the datatable. Here are the differently tested scaling and transformations in this project:
+
+* Scaling
+
+  - Autoscaling: for a metabolite $i$ of sample $j$, its autoscaled value $y_{ij}$ derived from its original value $x_{ij}$ is given by $y_{ij} = \frac{x_{ij}- \bar{x}_i}{s_i}$ where $s_i = \sqrt{\frac{1}{n-1}\sum_{i=1}^n (x_{ij} - \bar{x}_i)^2}$ and $\bar{x}_i = \frac{1}{n} \sum_{i=1}^n x_{ij}$
+  
+  - Pareto scaling: is similar to the autoscaling process but the scaling factor is different: $y_{ij} = \frac{x_{ij}- \bar{x}_i}{\sqrt{s_i}}$
+  
+  - Range scaling: the scaling factor is computed as the difference between the maximum metabolite value $x_{i_{max}}$ and the minimum metabolite value $x_{i_{min}}$: $y_{ij} = \frac{x_{ij}- \bar{x}_i}{(x_{i_{max}}-x_{i_{min}})}$
+  
+  - Vast scaling: uses the standard deviation $s_i$ and coefficient of variation ($cv=\frac{s_i}{\bar{x}_i}$) as scaling factor: $y_{ij} = \frac{x_{ij}- \bar{x}_i}{s_i}\cdot \frac{\bar{x}_i}{s_i}$
+  
+  - Level scaling: uses a location parameter rather than a dispersion parameter as scaling factor. In this case, we will use the mean: $y_{ij} = \frac{x_{ij}- \bar{x}_i}{\bar{x}_i}$
+  
+* Transformation
+
+  - Log10-transformation: applying the $\log_{10}(x_{ij})$ mathematical formula to every metabolite value
+  
+  - Hyperbolic arcsine transformation: for a specified value $x_{ij}$, $\sinh(x) = \frac{e^{x_{ij}} - e^{-x_{ij}}}{2}$ where $h$ represents hyperbolic and $e$ is the constant equal to approximately 2.718; the inverse of the function is $\sinh^{−1} (x_{ij})$ or the "arcsinh(x~ij~)".
+
+
+```{r, out.width='50%'}
+#Mean-var plot UNSCALED
+MeanVarPlot(df = t.stan, cohort = "Stanford", scale = "Unscaled")
+MeanVarPlot(df = t.umd, cohort = "UMD", scale = "Unscaled")
+```
+
+```{r, out.width='50%'}
+#Mean-var plot AUTOSCALING
+scale.function(df = t.stan, choice = "autoscaling") |> 
+  MeanVarPlot(cohort = "Stanford", scale = "autoscaling", x.y.log10 = FALSE) + labs(x = "mean Intensity", y = "Intensity variance")
+scale.function(df = t.umd, choice = "autoscaling") |> 
+  MeanVarPlot(cohort = "UMD", scale = "autoscaling", x.y.log10 = FALSE) + labs(x = "mean Intensity", y = "Intensity variance")
+```
+
+```{r, out.width='50%'}
+#Mean-var plot PARETO scale
+scale.function(df = t.stan, choice = "pareto")|> 
+  MeanVarPlot(cohort = "Stanford", scale = "Pareto scale")
+scale.function(df = t.umd, choice = "pareto") |>
+  MeanVarPlot(cohort = "UMD", scale = "Pareto scale")
+```
+
+```{r, out.width='50%'}
+#Mean-var plot RANGE scaling
+scale.function(df = t.stan, choice = "range") |>
+  MeanVarPlot(cohort = "Stanford", scale = "range scaling")
+scale.function(df = t.umd, choice = "range") |> 
+  MeanVarPlot(cohort = "UMD", scale = "range scaling")
+```
+
+```{r, out.width='50%'}
+#Mean-var plot VAST scaling
+scale.function(df = t.stan, choice = "vast") |> 
+  MeanVarPlot(cohort = "Stanford", scale = "vast scaling")
+scale.function(df = t.umd, choice = "vast") |> 
+  MeanVarPlot(cohort = "UMD", scale = "vast scaling")
+```
+
+```{r, out.width='50%'}
+#Mean-var plot LEVEL scaling
+scale.function(df = t.stan, choice = "level") |> 
+  MeanVarPlot(cohort = "Stanford", scale = "level scaling")
+scale.function(df = t.umd, choice = "level") |> 
+  MeanVarPlot(cohort = "UMD", scale = "level scaling")
+```
+
+```{r, out.width='50%'}
+#Mean-var plot lOG10 scale
+scale.function(df = t.stan, choice = "log10") |>
+  MeanVarPlot(cohort = "Stanford",
+              scale = "log10 transformation", x.y.log10 = FALSE)+
+  labs(x = "mean Intensity", y = "Intensity variance")
+scale.function(df = t.umd, choice = "log10") |>
+  MeanVarPlot(cohort = "UMD", scale = "log10 scale", x.y.log10 = FALSE)+
+  labs(x = "mean log10(Intensity)", y = "variance log10(Intensity)")
+```
+
+```{r, out.width='50%'}
+#Mean-var plot using asinh scale
+MeanVarPlot(df = asinh(t.stan), cohort = "Stanford", scale = "Hyperbolic arcsine scale")
+MeanVarPlot(df = asinh(t.umd), cohort = "UMD", scale = "Hyperbolic arcsin scale")
+```
+
+
+To broadly summarize the findings of this section, one can say that a scaling or transformation of the initial datasets is useful. Indeed, the goal was to find a data format for which the metabolite's mean was not or poorly related to its variance. Through the previous graphs of Stanford and UMD cohorts, one can see:
+
+* The unscaled data has a clear relationship between mean and variance: the red line on the graph is the $y=2x$ function, thus indicating the mean-variance followed a similar function with another intercept. 
+
+* The autoscaling completely resolves the problem as the dashed linear function curve is $y=1$ (because dividing all columns by their respective standard deviation sets their respective variance to 1).
+
+* Pareto scaling, range scaling and vast scaling do not really help overall: the relationship between mean and variance is still positive.
+
+* Level scaling helps decrease the correlation between mean and variance since the dashed line is almost horizontal.
+
+* log10 and hyperbolic arcsine transformations do help stabilize the variance across metabolites. Furthermore, they help decrease mean-variance correlation in UMD cohort but not Stanford.
+
+Overall, the level scaling and both log10 and asinh transformations showed partial problem resolution. However, the log10 is probably the one with the most benefits in terms of variance stabilisation, interpretability and mean-variance relationship. Therefore, it will be used in the later sections of this project.
+
+```{r}
+#Transforming the data, combining it into a SummarizedExperiment and adding it to respective MAE object for both cohorts
+## STANFORD
+temp <- assay(STAN[["MB_filtered"]])
+l10.temp <- log10(temp)
+rownames(l10.temp) <- rownames(temp)
+SE.stan <- SummarizedExperiment(assays = l10.temp,
+                                rowData = rowData(STAN[["MB_filtered"]]), 
+                                colData = colData(STAN[["MB_filtered"]]))
+STAN <- c(STAN, MB_filt_transformed = SE.stan)
+
+## UMD
+temp <- assay(UMD[["MB_filtered"]])
+l10.temp <- log10(temp)
+rownames(l10.temp) <- rownames(temp)
+SE.umd <- SummarizedExperiment(assays = l10.temp,
+                               rowData = rowData(UMD[["MB_filtered"]]), 
+                               colData = colData(UMD[["MB_filtered"]]))
+UMD <- c(UMD, MB_filt_transformed = SE.umd)
+```
+
+### Lactate vs Lactobacillus
+
+For control purposes, let us draw another Lactate-vs-Lactobacillus plot with the newly transformed dataset:
+
+```{r}
+temp <- 
+  rbind(
+  tibble(Set = "Stanford",
+        Prop_Lacto = colData(STAN[["MB_filt_transformed"]])$Prop_Lacto, 
+        LactateInt = unlist(MetaboIntensity(assay(STAN[["MB_filt_transformed"]]), "^lactate"))),
+  tibble(Set = "UMD",
+        Prop_Lacto = colData(UMD[["MB_filt_transformed"]])$Prop_Lacto, 
+        LactateInt = unlist(MetaboIntensity(assay(UMD[["MB_filt_transformed"]]), "^lactate")))
+  )
+temp |> 
+  ggplot()+
+  aes(x = Prop_Lacto, y = LactateInt, col = Set)+
+  geom_point()+
+  geom_smooth(method = "lm", se = T, linetype = "dotted")+
+  facet_wrap(facets = vars(Set))+
+  labs(x = "Proportion of Lactobacillus spp.",
+       y = "log10(lactate peak intensity)")+
+  theme(legend.position = "")
+#Correlation table
+temp |>
+  group_by(Set) |>
+  summarize(Estimate = cor.test(x = Prop_Lacto, y = LactateInt,
+                                method = "spearman")$estimate,
+            Pvalue = cor.test(x = Prop_Lacto, y = LactateInt,
+                              method = "spearman")$p.value) |>
+  pander(caption = "Correlation test between proportion of Lactobacillus and lactate intensity per sample")
+```
+
+The association between the log10 lactate abundance and Lactobacillus proportion is very much similar to what was found in the previous section, except for the fact there is no need to rectify the y-axis for easier visualization since the log10 transformation homogenizes the dispersion.
+
+```{r}
+rm(l10.temp, SE.stan, SE.umd, temp, i, p1, p2, pval.stan, pval.umd)
+```
+
+### Exploring correlation using transformed data
+
+In the first section on missing values and data filtering, we focused our attention the potential correlation between some sample specific characteristics and the mean metabolite intensity per sample. However, such study was done on "untransformed" data. Since, the log10 scale was applied, the mean metabolite intensity might differ and therefore we could potentially find new results. Let us use a table summarizing the different correlations (same table format as before) and add a "mean intensity vs missing" plot.
+
+```{r}
+temp <- 
+  rbind(
+  data.frame(Set = "Stanford", 
+             colData(STAN[["MB_filt_transformed"]]),
+             Mean = colMeans(assay(STAN[["MB_filt_transformed"]]), na.rm = TRUE),
+             f_missing = colMeans(is.na(assay(STAN[["MB_filt_transformed"]])))),
+  data.frame(Set = "UMD", 
+             colData(UMD[["MB_filt_transformed"]]),
+             Mean = colMeans(assay(UMD[["MB_filt_transformed"]]), na.rm = TRUE),
+             f_missing = colMeans(is.na(assay(UMD[["MB_filt_transformed"]]))))) |>
+  select(Set, BMI, Age, GestationalAge_days, PH, cycle_nb,
+         cycle_length, cycleday, Reprod_status, Prop_Lacto, 
+         Mean, f_missing)
+```
+```{r}
+#Estimating correlation coefficient and testing it 
+CorTable <- 
+  temp |>
+  select(-c(Reprod_status, cycle_nb)) |>
+  pivot_longer(cols = -c(Set, Mean), 
+               names_to = "Variable", values_to = "Values") |>
+  group_by(Set, Variable) |>
+  na.omit() |>
+  summarize(estimate = cor.test(x = Values, y = Mean,
+                                method = "spearman")$estimate,
+            pvalue = cor.test(x = Values, y = Mean,
+                              method = "spearman")$p.value)
+#Anova tests for categorical variables
+anova <- 
+  temp |>
+  select(Set, Mean, Reprod_status, cycle_nb) |>
+  filter(Set == "UMD") |>
+  aov(formula = Mean ~ Reprod_status + cycle_nb) |>
+  summary()
+
+#Presentation correlation table in a wide format
+CorTable |>
+  pivot_wider(names_from = Set, 
+              values_from = c(estimate, pvalue)) |> 
+  setNames(nm = c(" ", 
+                  "Estimate\n Stanford", "Estimate\n UMD",
+                  "Pvalue\n Stanford", "Pvalue\n UMD")) |>
+  pander(missing = " ", keep.line.breaks = TRUE, caption = "Spearman's correlation coefficient and associated p-value between the mean log10(intensity) of metabolites and the different characteristics")
+
+anova |>
+  pander(missing = " ", caption = "UMD cohort only; one-way ANOVA test between mean log10(metabolite intensity) and categorical variables 'Reprod_status' and 'cycle_nb'")
+```
+
+The general results are the same, the significantly non-zero correlations are between mean metabolite intensity and:
+
+* `Age` and `Prop_Lacto` in Stanford
+
+* `Age` and `Prop_Lacto` in UMD
+
+Moreover, we cannot reject the hypothesis of homogenous metabolite intensity throughout the levels of the reproductive status and cycle number variables.
+
+```{r}
+temp |>
+  ggplot()+
+  aes(y = Mean, x = f_missing, col = Set) +
+  geom_point()+
+  geom_vline(xintercept = 0.5, 
+             linetype = "dashed", color = "grey")+
+  facet_wrap(facets = vars(Set))+
+  labs(x = "% of missing values per sample", 
+       y = "mean log10(intensity) of \n 'most common' metabolites)", 
+       subtitle = "log10 transformed data, each dot is a sample")+
+  theme(legend.position = "")
+#Correlation
+#temp |> group_by(Set) |> summarize(Estimate = cor.test(x = Mean, y = f_missing, method = "spearman", alternative = "two.sided", exact = FALSE)$estimate, Pvalue = cor.test(x = Mean, y = f_missing, method = "spearman", alternative = "two.sided", exact = FALSE)$p.value)
+```
+
+After comparing the previous "metabolite intensity vs missing" plot with the one above, the general shape is the same: a declining curve for both Stanford and UMD.
+
+## Imputation
+
+Let us recap what we've discovered regarding missing values:
+
+* Many missing values come from low-quantity metabolites:
+
+  - either because they are truly in low concentration in the vaginal environment,
+  
+  - or because the sample had low amounts of biological material 
+  
+* Missing values come from peak misalignment, which happened during the first processing step over which we had no control
+
+* Missing values are correlated to metabolite abundance, which is in turn correlated to age for Stanford and UMD
+
+Since we don't have any intelligence regarding the alignment process, we must base our imputation process on first kind of missing pattern: metabolite concentrations below LLOD. And rather to try and estimate this low limit of detection, we should look at the metabolite level and consider the unknown information.
+
+Since the peak intensity is proportional to the metabolite abundance, one may infer that the lowest amount detected is the close to the minimal observed peak intensity. In that case, missing values correspond to metabolite concentration below the minimal observed value and greater or equal to zero.
+
+Therefore, imputing missing values to 50% of the minimal metabolite-specific value is an appropriate imputation method.
+
+Furthermore, the correlation patterns have been observed, linking metabolite abundance to women's age. One could then adapt the imputation process to take age into account. Maybe, a system of weights could be a solution. 
+
+However, imputation is very complex and adding covariates might be too complicated for this project. A more advanced statistician with more experienced could improve the imputation process in later works.
+
+Let us stick to imputation to half the minimum value, metabolite wise, as this method, while relatively naive, is rather well suited. Undoubtedly, imputing the 'unscaled' data is better as the minimal observed value is the one of the peak intensity and not the log10(peak intensity).
+
+In the next chunck, the filtered data is transposed (so the metabolites are ordered in columns), imputed, then transformed to log10 scale, then re-transposed again for ulterior uses.
+
+```{r}
+se.stan <- STAN[["MB_filtered"]]
+se.umd <- UMD[["MB_filtered"]]
+#Transposing and imputing to half the minimum with weights
+t.stan.imp <- 
+  se.stan |>
+  Transposer() |>
+  DataProcessingForPCA(log10 = TRUE)
+t.umd.imp <- 
+  se.umd |>
+  Transposer() |>
+  DataProcessingForPCA(log10 = TRUE)
+#Retransposing
+stan.imp <- t(t.stan.imp)
+umd.imp <- t(t.umd.imp)
+```
+```{r, out.width='50%'}
+#Missing grid
+vis_miss(t.stan.imp)+theme(axis.text.x = element_blank())+labs(subtitle = "Stanford dataset", y = "Samples", y = "Metabolites")
+vis_miss(t.umd.imp)+theme(axis.text.x = element_blank())+labs(subtitle = "UMD dataset", y = "Samples", y = "Metabolites")
+```
+
+```{r}
+#Saving results in MAE
+data.stan <- SummarizedExperiment(assays = stan.imp,
+                                  colData = colData(se.stan),
+                                  rowData = rowData(se.stan))
+data.umd <- SummarizedExperiment(assays = umd.imp,
+                                colData = colData(se.umd),
+                                rowData = rowData(se.umd))
+STAN <- c(STAN, MB_filt_imp_trans = data.stan)
+UMD <- c(UMD, MB_filt_imp_trans = data.umd)
+```
+
+In the future, one could use more elaborate imputation technique to take into account the variables with seen were correlated to metabolite abundance.
+
+```{r}
+rm(anova, CorTable, se.stan, se.umd, data.stan, data.umd, stan.imp, umd.imp, t.stan.imp, t.umd.imp, t.stan, t.umd, temp)
+```
+
+
+## Principal component analysis
+
+Following the study of the variance and data structure, an exploratory principal component analysis with missing values using `prcomp()` function was implemented. The goal here is to detect any peculiar structure in the data or any suspicious element linked to data dispersion. The eigenvalues are investigated first. Then, individuals and variables plot were drawn.
+
+```{r global.PCA}
+SE.stan <- STAN[["MB_filt_imp_trans"]]
+SE.umd <- UMD[["MB_filt_imp_trans"]]
+pca_stan <- prcomp(x = t(assay(SE.stan)), center = T, scale = T)
+pca_umd <- prcomp(x = t(assay(SE.umd)), center = T, scale = T)
+```
+
+```{r}
+get_eig(pca_stan)[1:10,] |> pander(caption = "Stanford eigenvalues")
+get_eig(pca_umd)[1:10,] |> pander(caption = "UMD eigenvalues")
+```
+
+In both pca, the first component is way bigger than the rest of components (`r round(get_eig(pca_stan)[1,2],2)`% in Stanford and `r round(get_eig(pca_umd)[1,2],2)`% in UMD). This could potentially be an effect introduced during data collection of measurement. It will be investigated further and handled in section \@ref(SizeEffect). There is nothing more worth noting from these tables. However, we can accompany these numbers with a barplot:
+
+```{r, out.width='50%'}
+fviz_eig(pca_stan, choice = "variance", 
+         barfill = CohCol["Stanford"], barcolor = CohCol["Stanford"], 
+         ncp = 10, main = "PCA Variance decomposition (Stanford)")
+fviz_eig(pca_umd, choice = "variance", 
+         barfill = CohCol["UMD"], barcolor = CohCol["UMD"], 
+         ncp = 10, main = "PCA Variance decomposition (UMD)")
+```
+
+Let us explore the individual's plot using the first 4 dimensions
+
+```{r, out.width='50%'}
+fviz_pca_ind(pca_stan, label = "none", title = "Stanford individuals", c(1,2), col.ind = CohCol["Stanford"])
+fviz_pca_ind(pca_umd, label = "none", title = "UMD individuals", c(1,2), col.ind = CohCol["UMD"])
+fviz_pca_ind(pca_stan, label = "none", title = "", c(3,4), col.ind = CohCol["Stanford"])
+fviz_pca_ind(pca_umd, label = "none", title = "", c(3,4), col.ind = CohCol["UMD"])
+```
+
+The effect of the great first dimension is intense in the first two scores' plots. Additionally, one could assume some effects in these data. For example, there could be a division between the samples of either batches for Stanford. Moreover, since 5 samples were collected longitudinally for each subject, we could expect small clusters of individual points to correlate with within subject variance.
+
+Let us first color the individuals of Stanford according to batch:
+
+```{r, out.width='50%'}
+fviz_pca_ind(pca_stan, label = "none", title = "Stanford individuals", c(1,2), col.ind = SE.stan$Batch, palette = BatchColors)
+fviz_pca_ind(pca_stan, label = "none", title = "Stanford individuals", c(3,4), col.ind = SE.stan$Batch, palette = BatchColors)
+fviz_pca_ind(pca_stan, label = "none", title = "Stanford individuals", c(4,5), col.ind = SE.stan$Batch, palette = BatchColors)
+```
+
+Clearly, there is a batch effect which is particularly well explained by components 4 and 5. Such an effect would influence our results and should be dealt with (see next section)
+
+The second element of interest is a potential within subject correlation. Now, because there are 40 subjects in each cohort, let us simplify the coloring of the following graphs by selecting 10 random subjects in each cohort. These 10 subjects will have their own personal color and the rest will be of a single color. If one was to detect clusters of same colored datapoints, then one could hypothesize a longitudinal effect.
+
+```{r}
+#Sampling 10 random subjects
+set.seed(123)
+subj.stan <- sample(x = unique(SE.stan$Subject), size = 10, replace = FALSE)
+subj.umd <- sample(x = unique(SE.umd$Subject), size = 10, replace = FALSE)
+#Labelling
+Sampled.stan <- c()
+  for(i in 1:length(SE.stan$Subject)){
+    if(SE.stan$Subject[i] %in% subj.stan){
+      Sampled.stan[i] <- SE.stan$Subject[i]
+    } else{Sampled.stan[i] <- "(other)"}
+  }
+Sampled.umd <- c()
+  for(i in 1:length(SE.umd$Subject)){
+    if(SE.umd$Subject[i] %in% subj.umd){
+      Sampled.umd[i] <- SE.umd$Subject[i]
+    } else{Sampled.umd[i] <- "(other)"}
+  }
+#Selecting palette
+palette <- c("grey90", 
+             "#1F77B4", "#FF7F0E", "#2CA02C", "#D62728", "#9467BD",
+             "#8C564B", "#E377C2", "#00BC00", "#BCBD22", "#17BECF")
+```
+```{r, out.width='50%'}
+#Plotting
+fviz_pca_ind(pca_stan, geom = "point", title = "Stanford", c(1,2), habillage = Sampled.stan, palette = palette, pointshape = 19)
+fviz_pca_ind(pca_umd, geom = "point", title = "UMD", c(1,2), habillage = Sampled.umd, palette = palette, pointshape = 19)
+fviz_pca_ind(pca_stan, geom = "point", title = "Stanford", c(3,4), habillage = Sampled.stan, palette = palette, pointshape = 19)
+fviz_pca_ind(pca_umd, geom = "point", title = "UMD", c(3,4), habillage = Sampled.umd, palette = palette, pointshape = 19)
+```
+
+Using the first 4 dimensions, there doesn't seem to be a structure correlated with the subject.
+
+Let us explore the variable's plot :
+
+```{r, out.width='50%'}
+fviz_pca_var(pca_stan, c(1,2), label = "none", title = "Stanford variables", col.var = CohCol["Stanford"])
+fviz_pca_var(pca_umd, c(1,2), label = "none", title = "UMD variables", col.var = CohCol["UMD"])
+fviz_pca_var(pca_stan, c(3,4), label = "none", title = "Stanford variables", col.var = CohCol["Stanford"])
+fviz_pca_var(pca_umd, c(3,4), label = "none", title = "UMD variables", col.var = CohCol["UMD"])
+```
+
+Without surprise, all variables are highly correlated with the first dimension. Once again, it will be considered in an ulterior section. Some variables amongst Stanford data are probably correlated to the batch distinction.
+
+```{r}
+rm(SE.stan, SE.umd, pca_stan, pca_umd, i, Sampled.stan, Sampled.umd, subj.stan, subj.umd, palette)
+```
+
+
+## Batch analysis
+
+As mentionned in the previous section, part of the variability in the Stanford data comes from the batch. Indeed, Stanford biological samples were sent for treatment and measurements in two different batches, refered to as _batch1_ and _batch2_. Table \@ref(BatchCount) below  displays the number of samples in each batch out of the `r ncol(assay(STAN[["MB_filt_imp_trans"]]))` samples from Stanford metabolomics dataset.
+
+```{r BatchCount}
+SE.stan <- STAN[["MB_filt_imp_trans"]]
+
+table(SE.stan$Batch) |> pander(caption = "Number of samples in each batch")
+```
+
+A batch effect might happen if, for example, the chemical buffer used for spectrometry was different in the two batches, or if the spectrometer wasn't calibrated the same way. Thus, the source of batch differences are probably systematic artificial and technical errors. Batch effect would influence the results and interpretations. Of course, if this effect was minimal, then no intervention is required. However, as one can expect this effect to be prominent, a 'batch correction' is in order to mitigate this bias.
+
+There are different ways of detecting batch effect: principal component analysis (PCA), Bioconductor's `limma` package, etc. From the previous section's PCA, we clearly identified a batch influence.
+Liu, Q., Walker, D., Uppal, K. et al. Addressing the batch effect issue for LC/MS metabolomics data in data preprocessing. Sci Rep 10, 13856 (2020). https://doi.org/10.1038/s41598-020-70850-0
+
+### Variables correlated with batch
+
+To properly analyse the potential batch effect we can, in addition to the PC analysis, look at other indications of differences between the batches. In this context, the "batch" variable is a reference to the *measuring* differences there are between the samples of 'batch1' and 'batch2'. However, there is a chance that the two sub-cohorts corresponding to either batch come from two different populations, in statistical sense.
+
+In statistics, one makes the assumption that the samples on which we measured all variables are representatives of a bigger population. If it is truely the case, then one expects a given variable for all individuals to follow the same distribution. To each variable there is an underlying statistical distribution which is defined by everyone's data in a population.
+
+Ideally, the individuals who participated in this research should be a random sample of the global population of women. It is rarely the case in reality since the investigators probably set some criteria for participation such as age, minimal health status, cooperation and so on. Maybe only women from a certain socio-economic group were recruted in the research.
+
+Now it might be that the samples in batch2 correspond to women of a particular age group while the samples in batch1 belong to women of a distinctive age group. Indeed, by chance, some characteristics between the two sub-cohorts might differ. In that case, the batch would be confounded with other variables. If the batch was the only variable responsible for the differences between the sub-cohorts, then the batch correction would be plain and simple. However, if the batch is not the only variable responsible for the differences, then we should find all the potential biases and confounding variables to better judge and organise the correction.
+
+In this section, we analyse all potential differences between the two Stanford 'sub-cohorts'. Here are the different variables we wish to investigate:
+
+* Mean abundance of metabolites
+
+* Distribution of missing values
+
+* Proportion of races amongst the groups
+
+* Distribution of age
+
+* Distribution of gestational age (in days)
+
+
+```{r}
+ggplot()+
+  aes(x = colMeans(assay(SE.stan), na.rm = T), fill = SE.stan$Batch, col = SE.stan$Batch)+
+  geom_density(alpha = 0.5, position = "identity", bw=0.17)+
+  scale_color_manual(values = BatchColors)+
+  scale_fill_manual(values = BatchColors)+
+  labs(x = "Mean log10(Intensity)", fill = "Group", col = "Group") +
+  theme(legend.position = "right")
+```
+```{r}
+t.stan <- t(assay(SE.stan))
+#Testing equality of distribution...
+df <- data.frame(mean = rowMeans(t.stan), Batch = SE.stan$Batch)
+#First test = wilcoxon test
+res <- wilcox.test(x = df[df$Batch == "Batch1","mean"],
+                   y = df[df$Batch == "Batch2","mean"],
+                   alternative = "two.sided")
+#Second test = Kolmogorov-Smirnov test
+res.ks <- ks.test(x = df[df$Batch == "Batch1","mean"],
+                  y = df[df$Batch == "Batch2","mean"],
+                  alternative = "two.sided")
+```
+
+Graphically speaking, there seems to be a slight difference between the density of the two *sub-cohorts*, suggesting a difference in mean abundance. This observation is supported by Mann-Whitney (MW) and Kolgmogorov-Smirnov's (KS) non parametric tests of equal distribution, with pvalue equal to `r res$p.value` for MW and `r res.ks$p.value` for KS. Such low p-values suggest rejecting the null hypothesis of matching distributions. Therefore, one cannot assume the sub-cohorts have the same metabolite abundance distribution.
+
+```{r}
+#Gestational age and age plots
+p1 <- ggplot(data = data.frame(colData(SE.stan)))+
+  aes(x = GestationalAge_days, y = ..density.., fill = Batch, col = Batch)+
+  geom_histogram(bins = 20, position = "identity", alpha = 0.5)+
+  geom_density(alpha = 0)+
+  scale_fill_manual(values = BatchColors)+
+  scale_color_manual(values = BatchColors)
+p2 <- ggplot(data = data.frame(colData(SE.stan)))+
+  aes(x = Age, y = ..density.., fill = Batch, col = Batch)+
+  geom_histogram(bins = 18, position = "identity", alpha = 0.5)+
+  geom_density(alpha = 0)+
+  scale_fill_manual(values = BatchColors)+
+  scale_color_manual(values = BatchColors)
+
+(p1 + p2)+plot_layout(guides = "collect")&theme(legend.position = "bottom")
+```
+
+The distribution of age and gestational age is quite similar in both sub-cohorts.
+
+```{r}
+#Computing proportions per CST and Batch
+tab <- xtabs(~ Race + Batch, data = colData(SE.stan))
+tbl <- cbind(data.frame(tab), data.frame(prop.table(tab,1))[3])
+colnames(tbl) <- c("Race", "Group", "Freq", "Prop")
+tbl$Label <- paste0(tbl$Freq, " (",round(tbl$Prop*100,0),"%)")
+piv.tbl <- pivot_wider(data = tbl[c("Race", "Group", "Label")], 
+                       names_from = Race, values_from = Label)
+piv.tbl |> pander()
+#Proportional column plot
+ggplot(tbl)+
+  aes(x = Race, y = Prop, fill = Group)+
+  geom_col(position = "fill", alpha = 0.5)+
+  scale_y_continuous(labels = scales::percent)+
+  scale_fill_manual(values = BatchColors)+
+  theme(legend.position = "bottom")
+```
+
+Through the previous graph and table, we cannot say the race is balanced out between the batches. Additionally, with a $\chi^2$ test pvalue of `r chisq.test(x = tab)$p.value`, we reject the null hypothesis of proportional categories. We conclude there is a difference of race proportions across batches.
+
+The batch effect is also confounded with between-patient variability as all samples from a patient correspond either to Batch 1 or Batch 2, see table \@ref(BatchContingencyTable).
+
+```{r}
+temp <- tibble(Patient = as.factor(SE.stan$Subject),
+               Batch = as.factor(SE.stan$Batch))
+xtabs(~ Batch + Patient, data = temp) |> 
+  t() |> 
+  pander(caption = "Partitioning of Stanford samples into batches")
+```
+
+In conclusion, the _distribution of metabolites mean abundance_ and the _race_ can be considered as confounding with the batch effect. Ideally, one should take into account these variables while correcting the batch effect.
+
+### Correcting batch effect {.tabset}
+
+More than one research have studied the correction of batch effect [Source1](Yu, Y., Zhang, N., Mai, Y. et al. Correcting batch effects in large-scale multiomics studies using a reference-material-based ratio method. Genome Biol 24, 201 (2023). https://doi.org/10.1186/s13059-023-03047-z) [source2](Liu, Q., Walker, D., Uppal, K. et al. Addressing the batch effect issue for LC/MS metabolomics data in data preprocessing. Sci Rep 10, 13856 (2020). https://doi.org/10.1038/s41598-020-70850-0). Most of them rely on homogenizing the location and dispersion of datapoints of all batches. It is rather similar to a standardizing or normalization procedure.
+
+In R, different packages exist for batch correction: `sva`, `limma`, `MetabolomicsQC`, `BatchCorr`, `xcms`, etc. Out them all, `limma` might be the most adequate one as it can control for potential confounding variables and take incomplete datasets (i.e. with missing values) as input.
+
+#### Exploring data using BioConductor's `limma` package
+```{r}
+rm(p1, p2, res, res.ks, t.stan, df, tab, tbl, temp, piv.tbl, SE.stan)
+```
+
+
+The `limma` package from Bioconductor offers multiple tools for exploring and modeling omics data. It was initially designed to work with gene expression count data, but was later adapted to a great number of different -omics data, including metabolomics. The main function of this package is to fit a linear model for every gene (or metabolite) of a dataset and to compile the information to infer differential expression. It not only generalizes the analysis, but it can also take into account the between gene variance and the sample correlation structures (for example, repeated measures or batch). However, `limma` is also adapted for pre-processing steps of a standard data analysis procedure. \ref[Ritchie et al. 2015](https://doi:10.1093/nar/gkv007)
+
+In this section, we take advantage of the `removeBatchEffect()` and `lmFit()` functions of this package. On the one hand, the `removeBatchEffect()` function will remove any systematic variation due to batches or any given covariates. Thanks to last section's analysis on batch and batch correlated variables. This function can implement a design matrix to take into account other parameters, like batch correlated variables. Using results from the previous section, we know we could add the `race` into the desgin matrix. Moreover, one could include any and all variables correlated to metabolite abundance (`age`, `gestational age`, `lactobacilli proportion`, see section CORR) since the abundance is correlated to the batch effect.
+
+On the other hand, the `lmFit()` function will fit a linear model. It can implement potential covariates in the process through a design matrix. The idea is to use the linear model to test or inspect whether the batch correction worked or not. Let us take the same design matrix for both the batch effect correction and linear model.
+
+On a side note, one advantage of `removeBatchEffect()` function is that it works on datatables which may contain missing values. At this stage of the project, we will use the latest processed dataset which is filtered, imputed and transformed. Future works on this data could focus on the batch effect removal of differently preprocessed data or differently ordered processing steps. Indeed, one could work on the initial unscaled filtered dataset, or try the hyperbolic arcsine scaled filtered dataset, or another transformation.
+
+```{r}
+SE.stan <- STAN[["MB_filt_imp_trans"]]
+#Relabeling reproductive status of Stanford cohort clinical data
+colData(SE.stan)$Reprod_status <- colData(SE.stan)$Reprod_status |> 
+  factor(labels = c("pregnant"))
+colData(SE.stan)[is.na(colData(SE.stan)$Prop_Lacto),"Prop_Lacto"] <- 0.000099
+#Relabeling reproductive status of UMD cohort clinical data
+#colData(SE.umd)$Reprod_status <- colData(SE.umd)$Reprod_status |>  factor(labels = c("menses", "follicular", "peri-ovulatory", "luteal", "undefined"))
+```
+
+**Boxplot and linear model before batch effect correction**
+
+Let us compute the linear model before batch effect correction using the `lmFit()` function and examine how the different covariates manage:
+
+```{r}
+#Design matrix
+design1 <- model.matrix(~ Batch + Age + Race + GestationalAge_days + Prop_Lacto, colData(SE.stan))
+# Fitting a linear model
+fit <- eBayes(lmFit(assay(SE.stan), design = design1))
+summary(decideTests(fit)) |> knitr::kable()
+#perform_lmFit(SE = SE.stan, formula = ~ Batch + Age + Race + GestationalAge_days + Prop_Lacto, transformation = "none")$results |> summary() |> knitr::kable()
+```
+
+To interpet this table, one has to know they were initially designed for gene expression datasets. The rows correspond to three categories of gene regulation: "down regulated", "Not significantly regulated" and "up regulated". In the case of metabolomics data, one could interpret those as "low abundance", "mean abundance" and "high abundance" respectively. The numbers in the cells correspond to the number of features (metabolites) that fall in each regulation category. Therefore, the table informs us on the variability induced by each variable of the design. If the variable introduces low variability, then one would expect all biochemicals to be in one single "abundance" category for that variable (either `down`, `Notsig` or `up`). Instead, if the variable is correlated to the abundance of the metabolites, then one could expect more variability and metabolites spread in two or more categories. (More about this 'regulation table' below ^*sim*^)
+
+For example, according to the table, there doesn't seem to be an Age effect in Stanford cohort since all biochemicals fall in the same category: the linear model did not detect much variability in peak intensity across the range of age values. This conclusion is quite different from the previous section \@ref(CorrPeak) on correlated attributes which showed us a significant correlation between age and peak intensity.
+
+The linear model also shows a batch effect: metabolites are partitioned across the three regulation categories, thus indicating variability due to batch. Similar partitionning exists for the lactobacilli proportion variable. However, the gestational age and the race do not seem to induce much variability.
+
+To be clearer on the consequences of the batch correction, we will build a boxplot of the samples before and after batch effect removal. Before removal, we had:
+
+```{r}
+#Boxplot for comparison
+SE.stan |>
+  assay() |>
+  data.frame() |>
+  pivot_longer(cols = 1:ncol(assay(SE.stan)),
+               names_to = "Sample", values_to = "l10Peak") |>
+  cbind(Batch = rep(SE.stan$Batch, nrow(assay(SE.stan)))) |>
+  ggplot() +
+  aes(x = Sample, y = l10Peak, fill = Batch)+
+  geom_boxplot(linewidth = 0.3)+
+  scale_fill_manual(values = BatchColors)+
+  labs(y = "log10(Peak intensity)", 
+       title = "Boxplots of metabolite intensity for each sample")+
+  theme(legend.position = "bottom", axis.text.x = element_blank())
+```
+
+**Boxplot and linear model before batch effect correction**
+
+```{r}
+#design matrix
+design2 <- model.matrix(~ Age + Race + GestationalAge_days + Prop_Lacto, colData(SE.stan))
+#Removing batch effect
+stan.BEr <- removeBatchEffect(x = assay(SE.stan), 
+                              batch = SE.stan$Batch, 
+                              design = design2)
+#colnames(stan.BEr) <- colnames(assay(SE.stan))
+#Boxplot for comparison
+stan.BEr |>
+  data.frame() |>
+  pivot_longer(cols = 1:ncol(stan.BEr),
+               names_to = "Sample", values_to = "l10Peak") |>
+  cbind(Batch = rep(SE.stan$Batch, nrow(assay(SE.stan)))) |>
+  tibble() |>
+  ggplot() +
+  aes(x = Sample, y = l10Peak, fill = Batch)+
+  geom_boxplot(linewidth = 0.3)+
+  scale_fill_manual(values = BatchColors)+
+  labs(y = "log10(Peak intensity)", 
+       title = "Boxplots of metabolite intensity for each sample")+
+  theme(legend.position = "bottom", axis.text.x = element_blank())
+```
+```{r}
+#lmFit after BE removal
+fit <- eBayes(lmFit(stan.BEr, design = design1))
+summary(decideTests(fit)) |> knitr::kable()
+```
+
+After batch effect removal, the variability linked to the batch seems to be low or absent according to the above tables.
+
+^*sim*^
+To construct the "regulation tables", I used three functions from `limma` package. The first one is `lmFit()` and, as explained previously, it fits a linear model for each feature (each metabolite). Then, I used `eBayes()` function which, given a linear model from `lmFit`, computes t-statistics, moderated F-statistics, and log-odds of differential expression by empirical Bayes method. The results of this function can be interpreted by the function `decideTests()` that can identify which metabolites are significantly differentially 'expressed' for each contrast from a fit object containing p-values and test statistics. This function also adjust for multiplicity testing by default, using Benjamini-Hochberg method, and a significance level of $0.05$. Therefore, the combination of these function really test the significance of the linear coefficients for the fitted model and takes into account the sign of this coefficient if it is significant.
+
+#### Batch effect corrrection using `Combat`
+
+Another correction was used: `sva`'s `Combat()` function. This function also uses empirical Bayes framework to adjust data for batch effect.
+
+```{r}
+SE.stan |>
+  assay() |>
+  data.frame() |>
+  pivot_longer(cols = 1:ncol(assay(SE.stan)), 
+               names_to = "Sample", values_to = "l10Peak") |>
+  cbind(Batch = rep(SE.stan$Batch, nrow(assay(SE.stan)))) |>
+  ggplot() +
+  aes(x = Sample, y = l10Peak, fill = Batch)+
+  geom_boxplot(linewidth = 0.3)+
+  scale_fill_manual(values = BatchColors)+
+  labs(y = "log10(Peak intensity)", 
+       title = "Boxplots of metabolite intensity for each sample",
+       subtitle = "(before batch correction)")+
+  theme(legend.position = "bottom", axis.text.x = element_blank())
+```
+
+
+```{r}
+#Batch correction with sva::ComBat()
+combat.stan <- sva::ComBat(dat = assay(SE.stan), 
+                           batch = SE.stan$Batch,
+                           mod = design2)
+#Boxplot for comparison
+combat.stan |>
+  data.frame(check.names = FALSE) |>
+  pivot_longer(cols = 1:ncol(combat.stan),
+               names_to = "Sample", values_to = "l10Peak") |>
+  cbind(Batch = rep(SE.stan$Batch, nrow(combat.stan))) |>
+  ggplot() +
+  aes(x = Sample, y = l10Peak, fill = Batch)+
+  geom_boxplot(linewidth = 0.3)+
+  scale_fill_manual(values = BatchColors)+
+  labs(y = "log10(Peak intensity)", 
+       title = "Boxplots of metabolite intensity for each sample",
+       subtitle = "(after BE removal)")+
+  theme(legend.position = "bottom", axis.text.x = element_blank())
+```
+
+It doesn't seem like `Combat` was more efficient at correcting batches except for the fact it generated less outliers.
+
+```{r}
+#Adding the batch effect removed SummarizedExperiment to MAE object for both cohorts
+STAN <- c(STAN, MB_filt_imp_trans_Batch = SummarizedExperiment(stan.BEr,
+                                                           rowData = rowData(STAN[["MB_filt_imp_trans"]]),
+                                                           colData = colData(STAN[["MB_filt_imp_trans"]])))
+```
+
+### Lactate-vs-Lactobacillus plot:
+
+```{r}
+#Extracting lactate intensity for each sample
+temp <- assay(STAN[["MB_filt_imp_trans_Batch"]])[str_detect(rownames(assay(STAN[["MB_filt_imp_trans_Batch"]])), pattern = "^lactate"),]
+#Lactate-vs-Lactobacillus graph
+tibble(Set = "Stanford",
+       Prop_Lacto = STAN[["MB_filt_imp_trans_Batch"]]$Prop_Lacto,
+       LactateInt = temp) |>
+  ggplot()+
+  aes(x = Prop_Lacto, y = LactateInt, col = Set)+
+  geom_point()+
+  geom_smooth(method = "lm", se = T, linetype = "dotted")+
+  facet_wrap(facets = vars(Set))+
+  labs(x = "Proportion of Lactobacillus spp.",
+       y = "log10(lactate peak intensity)")+
+  theme(legend.position = "")
+```
+
+The association between the log10 lactate abundance and Lactobacillus proportion is very much similar to what was found in the previous section.
+
+## Size effect
+
+```{r}
+rm(fit, SE.stan, SE.umd, stan.BEr, temp, t.stan.imp, design1, design2)
+```
+
+### Size effect identification
+
+While exploring the content and structure of the data, the principal component analysis on the Stanford cohort revealed a batch effect. It also revealed the majority of the data's variability (approximately 60%) can be explained using the first principal component, see \@ref(VarPlot). This observation is refered to as "size effect" and can be made on many omics data analyses cases.
+
+The size effect in this project comes from the sample collection process where patients were asked to take a vaginal swabs on their own and put the swab in a test tube filled with a liquid collection medium. The test tube would then be treated and their content transfered in spectrometer for measuring. Of course, the volume of that collection medium is supposedly identical for every swab (and the variability associated with that medium volume is assumed to be insignificant). However, the amount of biological material on the swab could potentially differ greatly between individuals and between time points. Therefore, the ratio between swab material and medium volume could vary considerably. This variability in material concentration influences the structure of the data. If this variance is great enough, then one could see that even a very frequent metabolite, such as lactate, could be very different from one sample to anotheronly because the material-medium ratio is considerably different. This applies to every metabolite. This variability in metabolite concentration is translated by the size effect.
+
+The size effect can be evaluated and visualized in next few plots for Stanford and UMD, where the first component comprises the most variance:
+
+```{r}
+t.stan <- t(STAN[["MB_filt_imp_trans_Batch"]] |> assay())
+t.umd <- t(UMD[["MB_filt_imp_trans"]] |> assay())
+pca_stan <- prcomp(x = t.stan, center = TRUE, scale = TRUE)
+pca_umd <- prcomp(t.umd, center = TRUE, scale = TRUE)
+```
+
+```{r, out.width='50%'}
+fviz_eig(pca_stan, ncp = 10, barfill = CohCol["Stanford"], barcolor = CohCol["Stanford"], title = "First 10 eigenvalues of the standardized Stanford data", choice = "eigenvalue")
+fviz_eig(pca_umd, ncp = 10, barfill = CohCol["UMD"], barcolor = CohCol["UMD"], title = "First 10 eigenvalues of the standardized UMD data", choice = "eigenvalue")
+```
+
+```{r, out.width='50%'}
+fviz_pca_var(X = pca_stan, choice = c(1,2), label = "none", col.var = CohCol["Stanford"])
+fviz_pca_var(X = pca_umd, choice = c(1,2), label = "none", col.var = CohCol["UMD"])
+```
+
+
+Additionally, one can see a clear correlation between the first principal component and the mean peak intensity, see figure \@CorPC1. However, this correlation is slight or inexistant with the second component. Thus, the size effect is the clearly maintained by the presence of this first dimension.
+
+```{r, fig.cap="CorPC1", out.width='100%'}
+rbind(
+  tibble(Set = "Stanford",
+       PC1 = pca_stan$x[,"PC1"],
+       PC2 = pca_stan$x[,"PC2"],
+       MeanI = rowMeans(t.stan)),
+  tibble(Set = "UMD",
+       PC1 = pca_umd$x[,"PC1"],
+       PC2 = pca_umd$x[,"PC2"],
+       MeanI = rowMeans(t.umd))
+  )  |>
+  pivot_longer(cols = c("PC1","PC2"), 
+               names_to = "PC", values_to = "Scores") |>
+  ggplot()+
+  aes(y = MeanI, x = Scores, col = Set)+
+  geom_point()+
+  facet_wrap(facets = vars(PC, Set), dir = "h")+
+  labs(y = "log10(Mean metabolite intensity)",
+       title = "Correlation between principal components and mean peak intensity")+
+  theme(legend.position = "none")
+```
+
+```{r}
+rbind(
+  tibble(Set = "Stanford",
+       PC1 = pca_stan$x[,"PC1"],
+       PC2 = pca_stan$x[,"PC2"],
+       MeanI = rowMeans(t.stan)),
+  tibble(Set = "UMD",
+       PC1 = pca_umd$x[,"PC1"],
+       PC2 = pca_umd$x[,"PC2"],
+       MeanI = rowMeans(t.umd))
+  ) |>
+  pivot_longer(cols = c("PC1", "PC2"),
+               names_to = "PC", values_to = "Scores") |>
+  pivot_wider(names_from = Set, values_from = Scores) |>
+  group_by(PC) %>%
+  summarize(Stanford.Intensity = cor(x = Stanford, y= MeanI,
+                                     method = "spearman",
+                                     use = "complete.obs"),
+            UMD.Intensity = cor(x = UMD, y= MeanI,
+                                method = "spearman",
+                                use = "complete.obs")) |> 
+  pander(caption = "Spearman's correlation coefficient")
+```
+
+### Correlation between mean metabolite and hos attributes {.tabset}
+
+```{r}
+#Extracting data for correlation analysis
+stan <- STAN[["MB_filt_imp_trans_Batch"]]
+umd <- UMD[["MB_filt_imp_trans"]]
+temp <- rbind(
+  tibble(
+    Set = "Stanford",
+    meanMB = colSums(assay(stan)),
+    colData(stan) |> as.data.frame()
+    ),
+  tibble(
+    Set = "UMD",
+    meanMB = colSums(assay(umd)),
+    colData(umd) |> as.data.frame()
+  )
+) |>
+    dplyr::select(Set, meanMB, SampleID, Age, BMI, GestationalAge_days, Prop_Lacto, PH, cycle_length, cycleday, Reprod_status, cycle_nb)
+```
+
+
+```{r}
+# AGE
+temp |>
+  ggplot()+
+  aes(x = Age, y = meanMB, col = Set)+
+  geom_point()+
+  geom_smooth(method = "lm", se = T, linetype = "dotted")+
+  facet_wrap(facets = vars(Set))+
+  labs(x = "Age", y = "log10(Mean metabolite Intensity per sample)")+
+  theme(legend.position = "")
+```
+
+```{r}
+# BMI
+ggplot(temp)+
+  aes(x = BMI, y = meanMB, col = Set)+
+  geom_point()+
+  geom_smooth(method = "lm", se = T, linetype = "dotted")+
+  labs(x = "BMI", y = "log10(Mean metabolite Intensity per sample)", subtitle = "Stanford") +
+  theme(legend.position = "none") + # Cycle_length
+ggplot(temp)+
+  aes(x = cycle_length, y = meanMB, col = Set)+
+  geom_point()+
+  geom_smooth(method = "lm", se = T, linetype = "dotted")+
+  labs(x = "cycle length (in days)", subtitle= "UMD")+
+  theme(axis.title.y = element_blank()) +
+plot_layout(guides = "collect", axes = "collect") & theme(legend.position = "none")
+
+# GestationalAge
+ggplot(temp)+
+  aes(x = GestationalAge_days, y = meanMB, col = Set)+
+  geom_point()+
+  geom_smooth(method = "lm", se = T, linetype = "dotted")+
+  labs(x = "Gestational age (in days)", y = "log10(Mean metabolite Intensity per sample)", subtitle = "Stanford") + # Cycle_day
+ggplot(temp)+
+  aes(x = cycleday, y = meanMB, col = Set)+
+  geom_point()+
+  geom_smooth(method = "lm", se = T, linetype = "dotted")+
+  labs(x = "cycle day", subtitle = "UMD")+
+  theme(axis.title.y = element_blank()) + 
+plot_layout(guides = "collect", axes = "collect") & theme(legend.position = "none")
+```
+
+```{r}
+# pH
+temp |> 
+  ggplot()+
+  aes(x = PH, y = meanMB, col = Set)+
+  geom_point()+
+  geom_smooth(method = "lm", se = T, linetype = "dotted")+
+  labs(x = "pH", y = "log10(Mean metabolite Intensity per sample)")+
+  theme(legend.position = "bottom")
+
+# Reproductive status
+temp |> 
+  ggplot()+
+  aes(x = Reprod_status, y = meanMB, col = Set)+
+  geom_jitter(width = 0.2)+ geom_boxplot(alpha = 0.2)+
+  labs(x = "Reproductive status", y = "log10(Mean metabolite Intensity per sample)")+
+  theme(legend.position = "right",
+        axis.text.x = element_text(angle = 45, vjust = 0.6))
+
+# Cycle_nb
+temp |> 
+  ggplot()+
+  aes(x = cycle_nb, y = meanMB, col = Set, group = cycle_nb)+
+  geom_jitter(width = 0.2)+ geom_boxplot(alpha = 0.2)+
+  labs(x = "cycle number", y = "log10(Mean metabolite Intensity per sample)")+
+  theme(legend.position = "bottom")
+```
+
+```{r}
+#Lactobacillus abundance according to diversity
+temp |> 
+  ggplot()+
+  aes(x = Prop_Lacto, y = meanMB, col = Set)+
+  geom_point()+ 
+  scale_x_continuous(labels = scales::label_percent())+
+  geom_smooth(method = "lm", se = T, linetype = "dotted")+
+  facet_wrap(facets = vars(Set))+
+  labs(x = "Proportion of Lactobacillus spp.", y = "log10(Mean metabolite Intensity per sample)")+
+  theme(legend.position = "")
+```
+
+```{r, message = FALSE, fig.cap="CorrelationCoefTables"}
+#Estimating correlation coefficient and testing it 
+CorTable <- 
+  temp |>
+  select(-c(Reprod_status, cycle_nb, SampleID)) |>
+  pivot_longer(cols = -c(Set, meanMB), 
+               names_to = "Variable", values_to = "Values") |>
+  group_by(Set, Variable) |>
+  na.omit() |>
+  reframe(estimate = cor.test(x = Values, y = meanMB,
+                                method = "spearman")$estimate,
+            pvalue = cor.test(x = Values, y = meanMB,
+                              method = "spearman")$p.value)
+#Anova tests for categorical variables
+anova <- 
+  temp |>
+  select(Set, meanMB, Reprod_status, cycle_nb) |>
+  filter(Set == "UMD") |>
+  aov(formula = meanMB ~ Reprod_status + cycle_nb) |>
+  summary()
+
+#Presentation correlation table in a wide format
+CorTable |>
+  pivot_wider(names_from = Set, 
+              values_from = c(estimate, pvalue)) |> 
+  setNames(nm = c(" ", 
+                  "Estimate\n Stanford", "Estimate\n UMD",
+                  "Pvalue\n Stanford", "Pvalue\n UMD")) |>
+  pander(missing = " ", keep.line.breaks = TRUE, caption = "Spearman's correlation coefficient and associated p-value between the mean intensity of metabolites and the different characteristics")
+
+anova |>
+  pander(missing = " ", caption = "UMD cohort only; one-way ANOVA test between mean metabolite intensity and categorical variables 'Reprod_status' and 'cycle_nb'")
+```
+
+### Size effect correction {.tabset}
+
+In order to make the samples more comparable, one needs to correct for this size effect. To do so, the eigenvectors of the datatable of Stanford and UMD were extracted using function `prcomp`. Afterwards, the first component / vector of scores are manually set to 0 as the idea was to eliminate the variability contained in PC 1. Then, an approximate data matrix is computed by multiplying the new scores matrix `T` by the loadings matrix `P` such that $X = T'P$. 
+
+To see the results, a new PCA was evaluated and represented graphically:
+
+```{r}
+stan.pc1.removed <- remove_pc1(pca = pca_stan)
+umd.pc1.removed <- remove_pc1(pca = pca_umd)
+```
+
+Since the scores and loadings were computed on a standardized datasets, the next step in order is to revert to a "non-standardized" dataset: the biochemical-wise standard deviation from the 'old' data is multiplied to the PC1-removed data and the biochemical-wise mean is added to the PC1-removed data. Mathematically speaking, the principal components were computed on centered and scaled data $X^{cs}_{ij}$ where
+
+$$
+X^{cs}_{ij} = \frac{X_{ij} - \bar{X}_i}{\sqrt{\sigma^2_{i}}}
+$$
+
+and $\bar{X}_i$ is the metabolite mean and $\sigma^2_i$ is the metabolite variance. Therefore, the score matrix was $T_{X^{cs}}$ and the approximated PC1-removed data was $\hat{X}^{cs}$. To obtain comparable data, one needs to compute
+
+$$
+\hat{X}_{ij} = \hat{X}^{cs} \cdot \sqrt{\sigma^2_i} + \bar{X}_i
+$$
+
+```{r}
+descale.function <- function(new.df, old.df){
+  sd <- apply(X = old.df, MARGIN = 2, FUN = sd, na.rm = TRUE)
+  mean <- apply(X = old.df, MARGIN = 2, FUN = mean, na.rm = TRUE)
+  
+  descaled.df <- new.df*sd + mean
+  rownames(descaled.df) <- rownames(old.df)
+  colnames(descaled.df) <- colnames(old.df)
+  return(descaled.df)
+}
+descaled.stan <- 
+  descale.function(new.df = stan.pc1.removed,
+                 old.df = t.stan)
+descaled.umd <- 
+  descale.function(new.df = umd.pc1.removed,
+                 old.df = t.umd)
+```
+
+#### Verifying size effect removal with limma
+
+One can verify whether the size effect has been properly removed in data $\hat{X}_{ij}$ by performing a PC analysis:
+
+```{r PCA.verif, out.width='50%'}
+#STANFORD
+pca_stan_SEr <- descaled.stan |>
+  PCA(graph = FALSE, scale.unit = TRUE)
+get_eig(pca_stan_SEr)[1:10,] |> pander(caption = "Stanford eigenvalues")
+#UMD
+pca_umd_SEr <- PCA(X = descaled.umd, graph = FALSE, scale = TRUE)
+get_eig(pca_umd_SEr)[1:10,] |> pander(caption = "UMD eigenvalues")
+```
+```{r PCA.verif.graph, out.width='50%'}
+#Variance plots
+fviz_pca_var(X = pca_stan_SEr, axes = c(1,2), label = "none", title = "Stanford correlation circle", col.var = CohCol["Stanford"])
+fviz_pca_var(X = pca_umd_SEr, axes = c(1,2), label = "none", title = "UMD correlation circle", col.var = CohCol["UMD"])
+fviz_pca_var(X = pca_stan_SEr, axes = c(3,4), label = "none", title = "Stanford correlation circle", col.var = CohCol["Stanford"])
+fviz_pca_var(X = pca_umd_SEr, axes = c(3,4), label = "none", title = "UMD correlation circle", col.var = CohCol["UMD"])
+#Individual plots
+Batch <- STAN[["MB_filt_imp_trans_Batch"]]$Batch
+fviz_pca_ind(X = pca_stan_SEr, axes = c(1,2), label = "none", title = "Stanford scores plot", col.ind = Batch, palette = BatchColors)
+fviz_pca_ind(X = pca_umd_SEr, axes = c(1,2), label = "none", title = "Stanford scores plot", col.ind = CohCol["UMD"])
+fviz_pca_ind(X = pca_stan_SEr, axes = c(3,4), label = "none", title = "Stanford scores plot", col.ind = Batch, palette = BatchColors)
+fviz_pca_ind(X = pca_umd_SEr, axes = c(3,4), label = "none", title = "Stanford scores plot", col.ind = CohCol["UMD"])
+```
+
+#### Verifying data structure with Combat
+
+```{r, out.width='50%'}
+#Imputation
+t.stan2 <- 
+  combat.stan |>
+  t() |>
+  data.frame(check.names = FALSE) |>
+  DataProcessingForPCA(log10 = FALSE)
+#PCA
+pca_stan2 <- prcomp(x = t.stan2, center = TRUE, scale = TRUE)
+#Size effect removal
+stan.pc1.removed2 <- remove_pc1(pca = pca_stan2)
+#Descaling
+descaled.stan2 <- 
+  descale.function(new.df = stan.pc1.removed2,
+                 old.df = t.stan2)
+#PCA
+pca_stan_SEr2 <- descaled.stan2 |>
+  scale(center = TRUE, scale = FALSE) |>
+  PCA(graph = FALSE, scale.unit = TRUE)
+#Plots
+get_eig(pca_stan_SEr2)[1:10,] |> pander(caption = "Stanford eigenvalues")
+fviz_pca_var(X = pca_stan_SEr2, axes = c(1,2), label = "none", title = "Stanford correlation circle", col.var = CohCol["Stanford"])
+fviz_pca_var(X = pca_stan_SEr2, axes = c(3,4), label = "none", title = "Stanford correlation circle", col.var = CohCol["Stanford"])
+fviz_pca_ind(X = pca_stan_SEr2, axes = c(1,2), label = "none", title = "Stanford scores plot", col.ind = Batch, palette = BatchColors)
+fviz_pca_ind(X = pca_stan_SEr2, axes = c(3,4), label = "none", title = "Stanford scores plot", col.ind = Batch, palette = BatchColors)
+```
+
+
+```{r}
+#Adding to existing MultiAssayExperiment
+STAN <- c(STAN,
+          MB_clean = SummarizedExperiment(assay = t(descaled.stan),
+                                          rowData = rowData(STAN[["MB_filt_imp_trans_Batch"]]),
+                                          colData = colData(STAN[["MB_filt_imp_trans_Batch"]]),
+                                          metadata = list(History = "This SummarizedExperiment contains the Stanford Metabolite data which has been filtered, imputed, transformed to log10 scale, batch effect corrected, and size effect corrected")))
+
+UMD <- c(UMD,
+         MB_clean = SummarizedExperiment(assay = t(descaled.umd),
+                                         rowData = rowData(UMD[["MB_filt_imp_trans"]]),
+                                         colData = colData(UMD[["MB_filt_imp_trans"]]),
+                                         metadata = list(History = "This SummarizedExperiment contains the UMD Metabolite data which has been filtered, imputed, transformed to log10 scale, and size effect corrected")))
+```
+
+### Lactate vs Lactobacillus graph
+
+```{r}
+#Lactate-vs-Lactobacillus graph
+temp <- 
+  rbind(
+  tibble(Set = "Stanford",
+         Prop_Lacto = STAN[["MB_clean"]]$Prop_Lacto,
+         LactateInt = MetaboIntensity(assay = assay(STAN[["MB_clean"]]))),
+  tibble(Set = "UMD",
+         Prop_Lacto = UMD[["MB_clean"]]$Prop_Lacto,
+         LactateInt = MetaboIntensity(assay = assay(UMD[["MB_clean"]])))
+  )
+
+temp |>
+  ggplot()+
+  aes(x = Prop_Lacto, y = LactateInt, col = Set)+
+  geom_point()+
+  geom_smooth(method = "lm", se = T, linetype = "dotted")+
+  facet_wrap(facets = vars(Set))+
+  labs(x = "Proportion of Lactobacillus spp.",
+       y = "log10(lactate peak intensity)")+
+  theme(legend.position = "")
+#Correlation table
+temp |>
+  group_by(Set) |>
+  summarize(Estimate = cor.test(x = Prop_Lacto, y = LactateInt,
+                                method = "spearman")$estimate,
+            Pvalue = cor.test(x = Prop_Lacto, y = LactateInt,
+                              method = "spearman")$p.value) |>
+  pander(caption = "Correlation test between proportion of Lactobacillus and lactate intensity per sample")
+```
+
+
+## Lactate vs Lactobacillus graphs
+
+This section is used to compare all 'Lactate vs Lactobacillus graphs' from every processing step.
+
+```{r}
+temp <- 
+  rbind(
+  tibble(Set = "Stanford",
+         Prop_Lacto = STAN[["MB_clean"]]$Prop_Lacto,
+         Filtered = unlist(MetaboIntensity(assay(STAN[["MB_filtered"]]))),
+         Filt_Transformed = unlist(MetaboIntensity(assay(STAN[["MB_filt_transformed"]]))),
+         Filt_imp_trans = unlist(MetaboIntensity(assay(STAN[["MB_filt_imp_trans"]]))),
+         Filt_Trans_BEr = unlist(MetaboIntensity(assay(STAN[["MB_filt_imp_trans_Batch"]]))),
+         Filt_Trans_SEr = unlist(MetaboIntensity(assay(STAN[["MB_clean"]])))),
+  tibble(Set = "UMD",
+         Prop_Lacto = UMD[["MB_clean"]]$Prop_Lacto,
+         Filtered = unlist(MetaboIntensity(assay(UMD[["MB_filtered"]]))),
+         Filt_Transformed = unlist(MetaboIntensity(assay(UMD[["MB_filt_transformed"]]))),
+         Filt_imp_trans = unlist(MetaboIntensity(assay(UMD[["MB_filt_imp_trans"]]))),
+         Filt_Trans_BEr = NA,
+         Filt_Trans_SEr = unlist(MetaboIntensity(assay(UMD[["MB_clean"]]))))
+  )
+#Switching to long format
+temp.long <- temp |>
+  pivot_longer(cols = 3:ncol(temp), 
+               names_to = "Data_status", values_to = "Lactate_intensity")
+```
+```{r}
+#Graphs
+temp |>
+  ggplot()+
+  aes(x = Prop_Lacto, y = Filtered, col = Set)+
+  geom_point()+
+  geom_smooth(method = "lm", se = T, linetype = "dotted")+
+  facet_wrap(facets = vars(Set))+
+  labs(x = "Proportion of Lactobacillus spp.",
+       y = "Lactate Intensity",
+       subtitle = "Filtered data (missing values: max 15% per metabolite & \n max 50% per sample)")+
+  theme(legend.position = "")
+temp |>
+  ggplot()+
+  aes(x = Prop_Lacto, y = Filt_Transformed, col = Set)+
+  geom_point()+
+  geom_smooth(method = "lm", se = T, linetype = "dotted")+
+  facet_wrap(facets = vars(Set))+
+  labs(x = "Proportion of Lactobacillus spp.",
+       y = "Lactate Intensity",
+       subtitle = "Filtered and log10 transformed data")+
+  theme(legend.position = "")
+temp |>
+  ggplot()+
+  aes(x = Prop_Lacto, y = Filt_imp_trans, col = Set)+
+  geom_point()+
+  geom_smooth(method = "lm", se = T, linetype = "dotted")+
+  facet_wrap(facets = vars(Set))+
+  labs(x = "Proportion of Lactobacillus spp.",
+       y = "Lactate Intensity",
+       subtitle = "Filtered, imputed, and log10 transformed data")+
+  theme(legend.position = "")
+temp |>
+  ggplot()+
+  aes(x = Prop_Lacto, y = Filt_Trans_BEr, col = Set)+
+  geom_point()+
+  geom_smooth(method = "lm", se = T, linetype = "dotted")+
+  facet_wrap(facets = vars(Set))+
+  labs(x = "Proportion of Lactobacillus spp.",
+       y = "Lactate Intensity",
+       subtitle = "Filtered, log10 transformed and batch effect corrected data")+
+  theme(legend.position = "")
+temp |>
+  ggplot()+
+  aes(x = Prop_Lacto, y = Filt_Trans_SEr, col = Set)+
+  geom_point()+
+  geom_smooth(method = "lm", se = T, linetype = "dotted")+
+  facet_wrap(facets = vars(Set))+
+  labs(x = "Proportion of Lactobacillus spp.",
+       y = "Lactate Intensity",
+       subtitle = "Filtered, log10 transformed, (batch effect corrected) \n and size effect corrected data")+
+  theme(legend.position = "")
+```
+```{r}
+#Correlation table
+temp.long |>
+  na.omit() |>
+  mutate(Data_status = factor(Data_status, levels = c("Filtered", "Filt_Transformed", "Filt_imp_trans", "Filt_Trans_BEr", "Filt_Trans_SEr"))) |>
+  group_by(Data_status, Set) |>
+  summarize(Estimate = cor.test(x = Prop_Lacto, y = Lactate_intensity,
+                                method = "spearman")$estimate,
+            Pvalue = cor.test(x = Prop_Lacto, y = Lactate_intensity,
+                              method = "spearman")$p.value) |>
+  pivot_wider(names_from = Set, values_from = c(Estimate, Pvalue)) |>
+  setNames(c("Status", "Estimate\n Stanford", "Estimate\n UMD", "Pvalue\n Stanford", "Pvalue\n UMD")) |>
+  pander(missing = " ", keep.line.breaks = TRUE, caption = "Correlation test between proportion of Lactobacillus and lactate intensity per sample", digits = 3)
+```
+
+
+## Saving results
+
+```{r}
+#Saving results
+saveRDS(STAN, file = "../05_Results/PreProcessedSTANFORD_mae.Rds")
+saveRDS(UMD, file = "../05_Results/PreProcessedUMD_mae.Rds")
+```

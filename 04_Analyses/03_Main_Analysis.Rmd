@@ -1,0 +1,1089 @@
+---
+title: "03_Main_Analysis"
+author: "Dupret Florent"
+date: "`r Sys.Date()`"
+output:
+  html_document: 
+    df_print: tibble
+    theme: yeti
+    highlight: tango
+    toc: yes
+    toc_depth: 4
+    toc_float: yes
+    number_sections: yes
+    fig_caption: yes
+    code_folding: hide
+editor_options: 
+  chunk_output_type: console
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, fig.show='hold', cache = FALSE, results = 'hold', warning = F, error = F, message = F)
+#Cleaning rstudio
+rm(list = ls())
+#Libraries required
+require(ggplot2)
+require(tidyverse)
+require(FactoMineR)
+require(factoextra)
+require(visdat)
+require(patchwork)
+require(SummarizedExperiment)
+require(MultiAssayExperiment)
+require(pander)
+library(magrittr)
+
+require(ade4)
+require(CCA)
+require(corrplot)
+require(CCP)
+require(mixOmics)
+library(multiblock)
+
+library(ggrepel)
+```
+```{r, include = FALSE}
+#Importing personal functions
+fs::dir_map(path = "../04_Analyses/Main_functions", 
+            fun = source)
+#Ggplot theme
+theme_set(theme_minimal())
+#Colors for Cohort and Batch
+CohCol <- c("#F8766D", "#00BFC4") |> set_names(c("Stanford", "UMD")) #Ggplot default binary colors
+BatchColors = c("firebrick", "#FEB7AA") |> set_names(c("Batch1", "Batch2")) #c("#B4193A", "#F1A99A")
+Dcol = data.frame(Stanford = c("#FB9A99", "#E31A1C"),
+                  UMD = c("#A6CEE3", "#1F78B4"),
+                  row.names = c("Metabo", "Subc"))
+#Dcol = c("seagreen3", "purple1")
+```
+
+# Context
+
+Goal of this document: evaluate association between metabolomic profile and bacterial composition.
+Data: preprocessed metabolite peak intensities and preprocessed relative abundance of bacterial species.
+Data structure: within (temporal) and between subject correlation present (all other correlations were discarded or adjusted for, except maybe the size effect)
+
+```{r}
+STAN <- readRDS("../05_Results/PreprocessedSTANFORD_mae.Rds")
+UMD <- readRDS("../05_Results/PreprocessedUMD_mae.Rds")
+```
+
+For the following analysis, if necessary, we will limit the number of variables (or latent variables) to the arbitrary number of $50$. For example, in an eventual PCA, we can manually choose to summarize the data on the first 50 principal components.
+
+```{r}
+#Number of max variables (or latent variables)
+nvar <- 50
+```
+
+
+# Data analysis
+
+To measure and visualize associations between datatables, we can use a series of methods. In this document, we perform STATIS analysis, Simultaneous component analysis, and canonical correlation analysis. Once again, we will perform the analysis separately for Stanford and UMD samples.
+
+But first, let us detail the notation to use to explain the three types of analysis: STATIS analysis, simultaneous component analysis (SCA), and canonical correlation analysis (CCA).
+
+* Let the number of datatables be $k=1,...,K$. In our case, $K=2$ because we have the metabolite table (let us call it $X_{k=1}$) and the compositional table (let us call it $X_{k=2}$). In the following paragraphs, we will refer to the tables $X_k$ either as "tables", "blocks", or "block matrices".
+
+* The dimensions of the block matrices are $n_k \times p_k$
+
+* The following analysis rely on "common-row" blocks with different variables, meaning the observations of the blocks must be identical. Indeed, both metabolite and composition tables share the same samples (from the same 80 women). Therefore, we can write $n_1 = n_2 = n$ and simplify the dimensions of the blocks to $n \times p_k$
+
+We note that, because we filtered samples in the metabolite preprocessing, we must match the remaining samples in the compositional data. This has as a consequence some information losses. Here are the dimensions and structure of both block matrices for Stanford and UMD:
+
+```{r}
+#Defining datasets
+#MB.SE.stan <- STAN[["MB_clean"]]
+MB.SE.stan <- STAN[["MB_filt_imp_trans_Batch"]] #Will yield other results
+VM.SE.stan <- STAN[["c_topics_16S_10"]]
+#MB.SE.umd <- UMD[["MB_clean"]]
+MB.SE.umd <- UMD[["MB_filt_imp_trans"]] #Will yield other results
+VM.SE.umd <- UMD[["c_topics_16S_10"]]
+#Keeping only matching samples
+MB.SE.stan <- MB.SE.stan[,colnames(MB.SE.stan) %in% colnames(VM.SE.stan)]
+VM.SE.stan <- VM.SE.stan[,colnames(VM.SE.stan) %in% colnames(MB.SE.stan)]
+MB.SE.umd <- MB.SE.umd[,colnames(MB.SE.umd) %in% colnames(VM.SE.umd)]
+VM.SE.umd <- VM.SE.umd[,colnames(VM.SE.umd) %in% colnames(MB.SE.umd)]
+#Extracting assay data
+VM.stan <- t(assay(VM.SE.stan)) |> 
+  scale(center = T, scale = T)
+MB.stan <- t(assay(MB.SE.stan)) |> 
+  scale(center = T, scale = T)
+VM.umd <- t(assay(VM.SE.umd)) |> 
+  scale(center = T, scale = T)
+MB.umd <- t(assay(MB.SE.umd)) |> 
+  scale(center = T, scale = T)
+#Mean-variance
+(ggplot()+aes(y = apply(VM.stan, MARGIN = 2, FUN = var),
+             x = apply(VM.stan, MARGIN = 2, FUN = mean))+
+  geom_point()+
+  labs(x = "mean", y = "variance",
+       subtitle = "Stanford subco") +
+  ggplot()+aes(y = apply(MB.stan, MARGIN = 2, FUN = var),
+             x = apply(MB.stan, MARGIN = 2, FUN = mean))+
+  geom_point()+
+  labs(x = "mean", y = "variance",
+       subtitle = "Stanford metabo"))/
+  (ggplot()+aes(y = apply(VM.umd, MARGIN = 2, FUN = var),
+             x = apply(VM.umd, MARGIN = 2, FUN = mean))+
+  geom_point()+
+  labs(x = "mean", y = "variance",
+       subtitle = "UMD subco") +
+  ggplot()+aes(y = apply(MB.umd, MARGIN = 2, FUN = var),
+             x = apply(MB.umd, MARGIN = 2, FUN = mean))+
+  geom_point()+
+  labs(x = "mean", y = "variance",
+       subtitle = "UMD metabo"))+
+  plot_layout(guides = "collect")
+```
+```{r}
+#Block scaling
+#(VM.stan/ncol(VM.stan)) |> apply(MARGIN = 2, FUN = sd)
+VM.stan <- (VM.stan/ncol(VM.stan)) #|> data.frame(check.names = F)
+MB.stan <- (MB.stan/ncol(MB.stan)) #|> data.frame(check.names = F)
+VM.umd <- (VM.umd/ncol(VM.umd)) #|> data.frame(check.names = F)
+MB.umd <- (MB.umd/ncol(MB.umd)) #|> data.frame(check.names = F)
+```
+```{r}
+paste("Dimension of Stanford metabolite data is ", dim(MB.stan)[1], "x", dim(MB.stan)[2])
+paste("Dimension of Stanford compositional data is ", dim(VM.stan)[1], "x", dim(VM.stan)[2])
+paste("Dimension of UMD metabolite data is ", dim(MB.umd)[1], "x", dim(MB.umd)[2])
+paste("Dimension of UMD compositional data is ", dim(VM.umd)[1], "x", dim(VM.umd)[2])
+```
+
+Finally, it is important to note that every dataset was centered around its feature-wise mean value and standardised (all standard deviation are reduced to 1).
+
+## STATIS analysis
+
+STATIS analysis, or "Structuration des Tableaux A Trois Indices de la Statistique" is a method founded by L'Hermier Des Plantes H. (1976) to initially study the existing associations between $K$ datatables with the following characteristics: $n$ common observations of $p$ common variables, measured $K$ different times. The main idea was to infer the _trajectory_ or _situations_ of these $n$ individuals over time. To make such inference, L'Hermier Des Plantes though of making a _compromise_ of all $K$ situations.
+
+In a way, STATIS method is similar to principal component analysis, in the sense that it finds latent (compromised) variables with the highest variability across situations. However, a novel but key element to this PCA is the consideration of the weight for each situation.
+
+The STATIS method can be considered in three steps:
+
+*First step (Interstructure)*:
+
+* Compute the similarity matrix $S_k = X_k X_k'$ for $k=1,...,K$ (one may recall that these similarity matrices are the backbone of the standard PCA)
+
+* Compute the $K \times K$ matrix $\mathcal{S}$ as a "combination" of the K $S_k$ matrices such that $\mathcal{S}_{kl}$ is $\text{trace}(S_k S_l)$: 
+
+$$\mathcal{S} = \Big( \big[\text{trace}(S_k S_l) \big]_{kl} \Big)_{k=1,...,K; l=1,...,K}$$
+
+* Perform a PCA on matrix $\mathcal{S}$ to obtain $K$ block coordinates (let us call them $Q_k$) of $X_k$ block matrices. The subspace created by these principal components is refered to as the \emph{interstructure}, or \emph{représentation des tables}. We will then compare the $[Q_k]_{k=1,...,K}$ to infer the similarity between two or more tables $[X_k]_{k=1,...,K}$. If the position of the individuals is similar in both tables $X_k$ and $X_l$, then the tables are similar and the vectors $\vec{OQ_k}$ and $\vec{OQ_l}$ will be collinear. The vectors $[\vec{OQ_k}]_{k=1,...,K}$ are usually studied in 2-dimensions (the first two principal components of $\mathcal{S}$), called $\mathcal{s}_1$ and $\mathcal{s}_2$, to make comparisons easier (rather than using the $K-1$ dimensions in which the individuals gather across tables) and because the first two components hold the greatest percentage of explained variance.
+
+*Second step (Compromise)*:
+
+* Define the compromise matrix: to do so, take the (first) eigenvector $W^{(1)}$ of the cross-table matrix $\mathcal{S}$ associated with the highest eigenvalue (therefore $W^{(1)}$ is the axis encompassing the highest variation of individuals' position across tables). Let us denote this eigenvectors' elements $[W^{(1)}_k]_{k=1,...,K}$.
+
+* The compromise matrix is $\sum_{k=1}^{K} W^{(1)}_k S_k$, and $W^{(1)}_k$ is a non-negative constant. Therefore the \emph{best compromise} is the weighted average, using weights from the first eigenvector of $\mathcal{S}$, of all similarity matrices $[S_k]_{k=1,...,K}$.
+
+*Third step (Intrastructure)*:
+
+* Perform PCA on compromise matrix $\mathcal{C}=\sum_{k=1}^{K} W^{(1)}_k S_k$
+
+* The PCA scores of the compromise matrix $\mathcal{C}$ translate a "compromised position" of each individual from the $K$ datatables in a subspace called the \emph{intrastructure}.
+
+* `ade4` takes by default the first two dimensions, denoted $\mathcal{c}_1$ and $\mathcal{c}_2$, to compare individuals across tables... in the intrastructure sub-space.
+
+According to [Van Deun, K. et.al](https://link.springer.com/article/10.1186/1471-2105-10-246?utm_source=getftr&utm_medium=getftr&utm_campaign=getftr_pilot#Bib1), the STATIS model can be written as an optimization problem of
+
+$$\arg \min_{T,P_k} W^{(1)}_k \sum_{k=1}^{K} \|X_k - TP_k' \|^2$$
+
+where $W^{(1)}_k$ is the $k^{\text{th}}$ element of the eigenvector of matrix $\mathcal{S}$, $X_k$ is the $k^{\text{th}}$ block matrix, and $T$ and $P_k$ are the scores matrix and loadings matrix, respectively, of the principal component decomposition of $X_k$ (such that $X_k = T P_k' + E_k$). One may notice that the loadings matrix, unlike the scores matrix, is block-dependent. It is because the $n$ individuals are the same across data tables.
+
+### Variance decomposition 
+To perform the statis analysis with function texttt{statis()} of package texttt{ade4}, we need to create a texttt{ktab} object summarizing the bloc datasets:
+
+```{r}
+ktabs.stan <- ktab.list.df(obj = list(Metabolite = as.data.frame(MB.stan),
+                                 Subcommunity = as.data.frame(VM.stan)))
+summary(ktabs.stan) |> pander()
+ktabs.umd <- ktab.list.df(obj = list(Metabolite = as.data.frame(MB.umd),
+                                 Subcommunity = as.data.frame(VM.umd)))
+summary(ktabs.umd) |> pander()
+```
+
+Easily enough, all the results of the statis analysis are summarized in the plot below:
+
+```{r}
+statis.stan <- ade4::statis(X = ktabs.stan, scannf = FALSE, nf = 4)
+statis.umd <- ade4::statis(X = ktabs.umd, scannf = FALSE, nf = 4)
+plot(statis.stan, cex = 0.3)
+plot(statis.umd, cex = 0.3)
+```
+
+Since the previous results are quite ugly and poorly represented, I make my own plots.
+
+First, we verify the matrices were given the same weight $[W^{(1)}_k]_{k=1,2}$
+
+```{r}
+#Manual weight computation
+weight <- function(MBmat, VMmat){
+  n <- nrow(MBmat)
+  
+  #Rescaling matrices by the sqrt of the column standard deviation
+  MB <- t(t(MBmat)*sqrt(apply(MBmat, 2, FUN = sd)))
+  VM <- t(t(VMmat)*sqrt(apply(VMmat, 2, FUN = sd)))
+  
+  #Similarity matrices
+  Smb <- as.matrix(MB) %*% t(as.matrix(MB))
+  Ssc <- as.matrix(VM) %*% t(as.matrix(VM))
+
+  #Matrix S
+  S <- matrix(unlist(list(Smb, Ssc)), n*n, 2)
+  #Raw RV matrix
+  RVraw <- t(S) %*% S
+  #sqrt of diag of RVraw
+  ak <- sqrt(diag(RVraw))
+  
+  #"Standardising" RV coef
+  RV <- sweep(RVraw, 1, ak, "/")
+  RV <- sweep(RV, 2, ak, "/")
+  #Eigendecomposition
+  eig <- eigen(RV, symmetric = T)$vector
+  
+  weights <- data.frame(sigma = abs(ak), W1 = abs(eig[,1]))
+  return(weights)
+}
+```
+```{r, out.width = '50%'}
+#Stanford
+tibble(
+  Set = statis.stan$tab.names,
+  Weights = weight(MB.stan, VM.stan)$W1,
+  sigma = weight(MB.stan, VM.stan)$sigma) |>
+  ggplot()+
+  aes(x = Weights, y = sigma, label = Set, col = Set)+
+  geom_label()+
+  scale_color_manual(values = Dcol$Stanford, aesthetics = c("colour", "fill"))+
+  labs(title = "Stanford", 
+       subtitle = "sigma diagonal as a function of weight table")+
+  theme(legend.position = "none")
+#UMD
+tibble(
+  Set = statis.umd$tab.names,
+  Weights = weight(MB.umd, VM.umd)$W1,
+  sigma = weight(MB.umd, VM.umd)$sigma) |>
+  ggplot()+
+  aes(x = Weights, y = sigma, label = Set, col = Set)+
+  geom_label()+
+  scale_color_manual(values = Dcol$UMD, aesthetics = c("colour", "fill"))+
+  labs(title = "UMD", 
+       subtitle = "sigma diagonal as a function of weight table")+
+  theme(legend.position = "none")
+```
+```{r}
+cbind(Cohort = c(rep("Stanford", 2), rep("UMD", 2)),
+      rbind(weight(MB.stan, VM.stan), weight(MB.umd, VM.umd))) |> 
+  tibble() |> mutate(Weight = W1/sigma) |>
+  pander(caption = "Weights")
+```
+
+Indeed, both "Metabo" and "Subc" have the same weight of `r statis.stan$RV.tabw[1]` and `r statis.umd$RV.tabw[1]` for Stanford and UMD respectively (x-axis), which is the square root of the inverse of the number of datasets (i.e. $\sqrt{1/2}$)
+
+Secondly, I want to have a very global idea of the significance of my analysis. So, I compute the RV coefficient. There are multiple ways to compute an RV coefficient. In texttt{ade4}, we can use the function texttt{RV.rtest()} which performs a Monte-Carlo test.
+
+In the Monte-Carlo simulations, the rows of each datatables are permuted randomly and the total inertia of the tables is computed. This inertia is the sum of all eigenvalues of the co-inertia analysis (i.e. an analysis aiming to find pairs of linear combinations $U$ and $V$ of the datasets' variables which maximize covariance: $cov(U_i, V_i) = cor(U_i, V_i) \sqrt{var(U_i) var(V_i)}$), "that is the sum of the covariances between successive pairs of axes". Through the permutation, the simulation may build the distribution of the inertia. The pvalue of the test is given by the frequency of observing the inertia value of the original datasets. [article](https://www.documentation.ird.fr/hor/fdi:010014295)
+
+The function texttt{statis} also computes an RV coefficient: here is the comparison:
+
+A minimum of 5000 permutations were applied to compute test significance
+
+```{r}
+rtest(MB.stan, VM.stan, MB.umd, VM.umd)
+data.frame(RV.coef = c(statis.stan$RV[1,2], statis.umd$RV[1,2]),
+           row.names = c("Stanford","UMD")) |> pander(caption = "RV coefficient between metabolite and compositional datasets using `statis` function for Stanford and UMD cohorts")
+```
+
+As we can see, the RV coefficients are the same whether one uses the explicit texttt{RV.rtest} function or the implicit output of the \texttt{statis} function. However, the first result also gives a significance level of observing such a coefficient. In this case, the pvalue is below the threshold of 0.05, thus indicating a coefficient greater than 0. Therefore, we can be sure there is an association between the metabolite and compositional data.
+
+Another approach to visualize the RV coefficient is to compute the cosine of the angle between the table vectors in the interstructure plot:
+
+```{r, out.width='100%'}
+Interstructure(statis.stan$RV.coo, Dcol = Dcol$Stanford, cohort = "Stanford")
+Interstructure(statis.umd$RV.coo, Dcol = Dcol$UMD, cohort = "UMD")
+##### Both interstructure on the same graph (because the values are standardised)
+tibble(Cohort = "Stanford",
+       block = rownames(statis.stan$RV.coo),
+       statis.stan$RV.coo) |>
+  rbind(tibble(Cohort = "UMD",
+               block = rownames(statis.umd$RV.coo),
+               statis.umd$RV.coo)) |>
+  ggplot()+
+  aes(xend = S1, yend = S2, x = 0, y = 0, col = Cohort)+
+  geom_segment(arrow = arrow(angle = 12, length = unit(0.3, "cm")))+
+  scale_fill_manual(values = c(unlist(Dcol[2,])), aesthetics = c("colour", "fill"))+
+  geom_vline(aes(xintercept = 0),
+             linetype = "dashed", col = "grey60")+
+  geom_hline(aes(yintercept = 0),
+             linetype = "dashed", col = "grey60")+
+  #Drawing a circle:
+  annotate("path", x = 0 + 1*cos(seq(0,2*pi,length.out=100)),
+           y= 0 + 1*sin(seq(0,2*pi,length.out=100)))+
+  coord_fixed(ratio = 1, xlim = c(-1.5,1.5))+
+  geom_text_repel(aes(label = block, x = S1, y = S2), nudge_y = 0.2)+
+  labs(x = "S1", y = "S2", subtitle = "Overlapping interstructure of Stanford and UMD")+
+  theme(legend.position = "bottom")
+```
+
+As we can see, both table vectors are highly correlated with the first dimension, indicating a certain proximity or "similarity" between the two tables. Moreover, the magnitude of the vectors (their norm) is 1, meaning they both contribute 100% to the compromise. This value of 100% is not accidental: when the number of data blocks to compare is equal to $2$, the dimension of $\mathcal{S}$ is $2\times2$ and therefore there can only be a maximum of 2 components. Hence, the total variance is captured by the first and only two components.
+
+I can also represent my datatables in the compromise' principal component subspace (called the intrastructure). To do so, I must first inspect the explained variance in the compromise principal components. Therefore, we can look at the variance decomposition (based on the computation of eigenvalues):
+
+```{r, out.width='50%'}
+eigentable.stan <- tibble(eigen = statis.stan$C.eig) |>
+    mutate(perc.var = eigen/sum(eigen)) |>
+    mutate(cum = cumsum(perc.var),
+           comp = factor(1:length(eigen)))
+eigentable.umd <- tibble(eigen = statis.umd$C.eig) |>
+    mutate(perc.var = eigen/sum(eigen)) |>
+    mutate(cum = cumsum(perc.var),
+           comp = factor(1:length(eigen)))
+
+scree(eigentable.stan[1:30,], cohort = "Stanford", col = CohCol["Stanford"])
+scree(eigentable.umd[1:30,], cohort = "UMD", col = CohCol["UMD"])
+```
+
+The first principal component explains `r round(eigentable.stan[1,2]*100,1)`% of the variance in Stanford and `r round(eigentable.umd[1,2]*100,1)`% in UMD. The first two components capture `r round(eigentable.stan$cum[2]*100,1)`% of the variance in Stanford and `r round(eigentable.umd$cum[2]*100,1)`% in UMD. Furthermore, we require `r dim(eigentable.stan[eigentable.stan$cum <= 0.75,])[1]+1` components to reach 75% of variance explained in Stanford, but `r dim(eigentable.umd[eigentable.umd$cum <= 0.75,])[1]+1` components in UMD.
+
+### Intrastructure
+
+Now I can explore the representation of my data blocks in the compromise'axis:
+
+```{r, out.width = '50%'}
+Intrastructure(C.T4 = statis.stan$C.T4, comp = c(1,2), level = 1,
+               eigentable = eigentable.stan, 
+               palette = Dcol$Stanford, cohort = "Stanford")
+Intrastructure(C.T4 = statis.umd$C.T4, comp = c(1,2), level = 1,
+               eigentable = eigentable.umd, 
+               palette = Dcol$UMD, cohort = "UMD")
+Intrastructure(C.T4 = statis.stan$C.T4, comp = c(3,4), level = 1,
+               eigentable = eigentable.stan, 
+               palette = Dcol$Stanford, cohort = "Stanford")
+Intrastructure(C.T4 = statis.umd$C.T4, comp = c(3,4), level = 1,
+               eigentable = eigentable.umd, 
+               palette = Dcol$UMD, cohort = "UMD")
+```
+
+One needs to note that the first two principal components of the compromise are well suited for capturing the variability across tables since the norm of the vectors is close to 1. Additionnally, both tables are highly correlated to the first principal component $C_1$.
+
+Let us focus on the representation of the individuals on the compromise dimensions (the "row coordinates"):
+
+```{r, out.width='100%'}
+ggplot(statis.stan$C.li)+
+  aes(x = C1, y = C2, col = MB.SE.stan$Prop_Lacto)+
+  geom_point()+
+  geom_vline(aes(xintercept = 0),
+             linetype = "dashed", col = "grey60")+
+  geom_hline(aes(yintercept = 0),
+             linetype = "dashed", col = "grey60")+
+  labs(subtitle = paste0("Stanford", " compromise"),
+       col = "Lactobacillus \n proportion")+
+  scale_color_gradient(low = "thistle2", high = "orchid4") +
+ggplot(statis.umd$C.li)+
+  aes(x = C1, y = C2, col = MB.SE.umd$Prop_Lacto)+
+  geom_point()+
+  geom_vline(aes(xintercept = 0),
+             linetype = "dashed", col = "grey60")+
+  geom_hline(aes(yintercept = 0),
+             linetype = "dashed", col = "grey60")+
+  labs(subtitle = paste0("UMD", " compromise"),
+       col = "Lactobacillus \n proportion")+
+  scale_color_gradient(low = "thistle2", high = "orchid4")+
+ggplot(statis.stan$C.li)+
+  aes(x = C3, y = C4, col = MB.SE.stan$Prop_Lacto)+
+  geom_point()+
+  geom_vline(aes(xintercept = 0),
+             linetype = "dashed", col = "grey60")+
+  geom_hline(aes(yintercept = 0),
+             linetype = "dashed", col = "grey60")+
+  labs(subtitle = paste0("Stanford", " compromise"),
+       col = "Lactobacillus \n proportion")+
+  scale_color_gradient(low = "thistle2", high = "orchid4")+
+ggplot(statis.umd$C.li)+
+  aes(x = C3, y = C4, col = MB.SE.umd$Prop_Lacto)+
+  geom_point()+
+  geom_vline(aes(xintercept = 0),
+             linetype = "dashed", col = "grey60")+
+  geom_hline(aes(yintercept = 0),
+             linetype = "dashed", col = "grey60")+
+  labs(subtitle = paste0("UMD", " compromise"),
+       col = "Lactobacillus \n proportion")+
+  scale_color_gradient(low = "thistle2", high = "orchid4")+
+  plot_layout(guides = "collect", axes = "collect", ncol = 2)
+```
+
+The individuals form a rather homogenous point cloud. There are no trend or outstanding points to report.
+
+### Column coordinates
+
+The configuration of this streched shape is most probably linked to the variables negatively correlated to the first compromise PC. Thus, we should explore the correlation and contribution of the different variables to the compromise:
+
+```{r}
+Col.coord(statis = statis.stan, comp = c(1,2), eigentable.stan, palette = Dcol$Stanford, cohort = "Stanford")
+Col.coord(statis = statis.stan, comp = c(3,4), eigentable.stan, palette = Dcol$Stanford, cohort = "Stanford")
+Col.coord(statis = statis.umd, comp = c(1,2), eigentable.umd, palette = Dcol$UMD, cohort = "UMD")
+Col.coord(statis = statis.umd, comp = c(3,4), eigentable.umd, palette = Dcol$UMD, cohort = "UMD")
+```
+```{r, eval = F}
+tibble(variab = rownames(statis.stan$C.Co),
+       data.frame(statis.stan$C.Co),
+       block = statis.stan$TC$T) |>
+  mutate(evid = ifelse(variab %in% c("lactate", "tyramine", "putrescine", "spermidine", "cystein", "hippurate"), variab, NA)) |>
+  mutate(varlab = ifelse(!(variab %in% c("lactate", "tyramine", "putrescine", "spermidine", "cystein", "hippurate")), variab, NA)) |>
+  dplyr::select(evid, varlab) |> tail()
+  ggplot()+
+  geom_segment(aes(xend = C1, yend = C2, x=0,y=0, col = evid))+
+  ggrepel::geom_text_repel(aes(x = C1, y = C2, label = variab),
+                           box.padding = 0.5)+
+  ggrepel::geom_text_repel(aes(x = C1, y = C2, label = evid),
+                           box.padding = 0.5)+
+  facet_wrap(facets=vars(block), scales = "free")
+```
+
+In Stanford:
+
+* Metabolites: metabolites are all negatively correlated to the first compromise axis. Hippurate stands out as it is the metabolite most correlated with the second PC. Tyramine is poorly correlated to either axis 1 and 2.
+
+* Subcommunity: textit{Lactobacillus}-dominated subcommunities, as opposed to non-textit{Lactobacillus}-dominated subcommunities, are all negatively correlated to the first axis, with subcommunity I (\textit{Lactobacillus iners}) and III (\textit{Lactobacillus crispatus}) being the most predominant variables. These two variables probably have a great influence on the positionning of the individuals in the compromise subspace. CST III and I are close together on dimensions 3 and 4 and are orthogonal to IV-O.a and IV-O.b.
+
+* Both: Hippurate is aligned with the first subcommunity "CST I", indicating a correlation between these two elements. Lactate, as expected, is negatively correlated with the first axis, along with all textit{Lactobacillus}-dominated subcommunities. Tyramine, putrescine, and N-acetyl-cadaverine are associated with CST IV-0.a in the third and forth dimensions.
+
+In UMD
+
+* Metabolites: hippurate stands out a little, compared to lactate and spermidine which are in the confounded in the crowd of vectors. Tyramine also stands out a little with its correlation to the second axis, like putrescine.
+
+* Subcommunity: the lactobacilli subcommunities are more negatively correlated to the first axis than the non-lactobacilli ones. CST-I and IV-O.a contribute most to the first and second axis respectively.
+
+* both: hippurate is correlated to CST-I, along with some other metabolites like asparagine. Xanthine, tyramine, and putrescine might be the most correlated metabolites with CST IV-O.a
+
+```{r, out.width='50%', eval = F}
+#Manual STATIS
+MB <- t(t(MB.stan)*sqrt(apply(MB.stan, 2, FUN = sd)))
+VM <- t(t(VM.stan)*sqrt(apply(VM.stan, 2, FUN = sd)))
+MB <- MB.stan
+VM <- VM.stan
+
+Smb <- as.matrix(MB) %*% t(as.matrix(MB))
+Ssc <- as.matrix(VM) %*% t(as.matrix(VM))
+
+S <- matrix(unlist(list(Smb, Ssc)), 191*191, 2)
+RVraw <- t(S) %*% S
+ak <- sqrt(diag(RVraw))
+
+RV <- statis.stan$RV
+eig <- eigen(RV)$vector
+
+C <- (eig[1,1]/ak[1])*Smb + (eig[2,1]/ak[2])*Ssc
+dim(C)
+
+PCA <- FactoMineR::PCA(X = C, scale = FALSE, graph = FALSE)
+fviz_eig(PCA, ncp = 30)
+fviz_pca_ind(PCA, axes = c(1,2), label = "none")
+ggplot(statis.stan$C.li)+
+  aes(x = C1, y = C2)+
+  geom_point()+
+  geom_vline(aes(xintercept = 0),
+             linetype = "dashed", col = "grey60")+
+  geom_hline(aes(yintercept = 0),
+             linetype = "dashed", col = "grey60")+
+  labs(subtitle = paste0("Stanford", " compromise"),
+       col = "Lactobacillus \n proportion")
+Score <- PCA$ind$coord
+
+LoadM <- t(MB.stan) %*% Score
+LoadS <- t(VM.stan) %*% Score
+ggplot()+
+  geom_segment(aes(xend = LoadS[,1], yend = LoadS[,2],
+                   x = 0, y = 0))
+ggplot()+
+  geom_segment(aes(xend = LoadM[,1], yend = LoadM[,2],
+                   x = 0, y = 0))
+```
+```{r, eval = F}
+rm(C, cca.stan, cca.umd, Comb, eigentable.stan, eigentable.umd, LoadM, LoadS, loads1, loads2, PCA, Score, Smb, Ssc, var.tib.stan, var.tib.umd, X.stan, X.umd, Y.stan, Y.umd)
+# MANUALLY CHECKING ade4::statis FUNCTION
+## Inputs
+X <- ktabs.stan
+scannf = TRUE
+nf = 3
+tol = 1e-07
+##########
+## PART I
+if (!inherits(X, "ktab")) 
+    stop("object 'ktab' expected")
+lw <- X$lw
+nlig <- length(lw)
+cw <- X$cw
+ncol <- length(cw)
+ntab <- length(X$blo)
+indicablo <- X$TC[, 1]
+tab.names <- tab.names(X)
+auxinames <- ktab.util.names(X)
+statis <- list()
+sep <- list()
+lwsqrt <- sqrt(lw)
+##########
+## PART II
+for (k in 1:ntab) {
+    ak <- sqrt(cw[indicablo == levels(X$TC[, 1])[k]])
+    wk <- as.matrix(X[[k]]) * lwsqrt
+    wk <- t(t(wk) * ak)
+    wk <- wk %*% t(wk)
+    sep[[k]] <- wk
+}
+sep <- matrix(unlist(sep), nlig * nlig, ntab)
+RV <- t(sep) %*% sep
+ak <- sqrt(diag(RV))
+RV <- sweep(RV, 1, ak, "/")
+RV <- sweep(RV, 2, ak, "/")
+dimnames(RV) <- list(tab.names, tab.names)
+statis$RV <- RV
+###########
+## PART III.a
+eig1 <- eigen(RV, symmetric = TRUE)
+statis$RV.eig <- eig1$values
+if (any(eig1$vectors[, 1] < 0)) 
+    eig1$vectors[, 1] <- -eig1$vectors[, 1]
+tabw <- eig1$vectors[, 1]
+statis$RV.tabw <- tabw
+###########
+## PART III.b
+w <- t(t(eig1$vectors) * sqrt(eig1$values))
+w <- as.data.frame(w)
+row.names(w) <- tab.names
+names(w) <- paste("S", 1:ncol(w), sep = "")
+statis$RV.coo <- w[, 1:min(4, ncol(w))]
+###########
+## PART IV.a
+sep <- t(t(sep)/ak)
+#C.ro <- rowSums(sweep(sep, 2, tabw, "*"))
+C.ro <- rowSums(sweep(sep, 2, tabw, "*"))
+C.ro <- matrix(unlist(C.ro), nlig, nlig)
+###########
+## PART IV.b
+eig1 <- eigen(C.ro, symmetric = TRUE)
+rm(C.ro)
+eig <- eig1$values
+rank <- sum((eig/eig[1]) > tol)
+if (scannf) {
+    barplot(eig[1:rank])
+    cat("Select the number of axes: ")
+    nf <- as.integer(readLines(n = 1))
+    messageScannf(match.call(), nf)
+}
+if (nf <= 0) 
+    nf <- 2
+if (nf > rank) 
+    nf <- rank
+statis$C.eig <- eig[1:rank]
+statis$C.nf <- nf
+statis$C.rank <- rank
+###########
+## PART IV.c
+wref <- eig1$vectors[, 1:nf]
+rm(eig1)
+wref <- wref/lwsqrt
+w <- data.frame(t(t(wref) * sqrt(eig[1:nf])))
+row.names(w) <- row.names(X)
+names(w) <- paste("C", 1:nf, sep = "")
+statis$C.li <- w
+##########
+## PART V
+w <- as.matrix(X[[1]])
+for (k in 2:ntab) {
+    w <- cbind(w, as.matrix(X[[k]]))
+}
+w <- w * lw
+w <- t(w) %*% wref
+w <- data.frame(w, row.names = auxinames$col)
+names(w) <- paste("C", 1:nf, sep = "")
+statis$C.Co <- w
+```
+```{r, eval = F}
+##########
+## PART VI
+sepanL1 <- sepan(X, nf = 4)$L1
+w <- matrix(0, ntab * 4, nf)
+i1 <- 0
+i2 <- 0
+for (k in 1:ntab) {
+    i1 <- i2 + 1
+    i2 <- i2 + 4
+    tab <- as.matrix(sepanL1[X$TL[, 1] == levels(X$TL[, 1])[k], 
+        ])
+    tab <- t(tab * lw) %*% wref
+    for (i in 1:min(nf, 4)) {
+        if (tab[i, i] < 0) {
+            for (j in 1:nf) tab[i, j] <- -tab[i, j]
+        }
+    }
+    w[i1:i2, ] <- tab
+}
+w <- data.frame(w, row.names = auxinames$tab)
+names(w) <- paste("C", 1:nf, sep = "")
+statis$C.T4 <- w
+w <- as.matrix(statis$C.li) * lwsqrt
+w <- w %*% t(w)
+w <- w/sqrt(sum(w * w))
+w <- as.vector(unlist(w))
+sep <- sep * unlist(w)
+w <- apply(sep, 2, sum)
+statis$cos2 <- w
+###########
+## PART VII
+statis$tab.names <- tab.names
+statis$TL <- X$TL
+statis$TC <- X$TC
+statis$T4 <- X$T4
+class(statis) <- "statis"
+return(statis)
+#End of ade4::statis
+```
+
+```{r, eval = F}
+rm(eigentable.stan, eigentable.umd, ktabs.stan, ktabs.umd, res.stan, res.umd, statis.stan, statis.umd)
+```
+
+
+## Simultaneous Component Analysis
+
+### Theory
+
+Simultaneous component analysis (SCA) is very similar to STATIS method. It was originally designed to compare different groups of individuals on which one had measured the same set of variables. However, it has been adapted to study datasets of different set of variables on the same group of individuals. [multibloc::sca](https://cran.r-project.org/web/packages/multiblock/multiblock.pdf)
+
+The idea is still to perform a PCA on a weighted average of all similarity matrices $[S_k]_{k=1,...,K}$, but the weights are evenly distributed. [othersource](https://ppw.kuleuven.be/okp/_pdf/DeRoover2012CSCAF.pdf) 
+[url](https://link.springer.com/article/10.3758/s13428-011-0129-1).
+[dissertation](https://pure.rug.nl/ws/portalfiles/portal/22324119/Complete_dissertation.pdf). In that sense, the objective of the SCA is to optimize the following criterion:
+
+$$\arg \min_{T, P_k} \sum_{k=1}^{K} \|X_k - TP_k'\|^2$$
+
+One may compare it with the optimization problem of the STATIS method and notice that the weights $W^{(1)}$ are missing in SCA. That is because the weights are all the same in SCA.
+
+NOT SURE ABOUT THE FOLLOWING PARAGRAPH The scores being common to each dataset, the loadings become very interesting as they could potentially translate the correlations between $X_1$ and $X_2$ (i.e. the metabolite and composition data). Therefore, the simultaneous component analysis of common-row datasets is the study of the component loadings shared by the datasets. [OverviewOfSCA](https://doi.org/10.1186/1471-2105-10-246)
+[ASCA](https://doi.org/10.1093/bioinformatics/bti476).
+
+This analysis requires our two datasets on metabolites and compositional data. They must be formatted in such a way that the samples appear in rows and the features in columns. Moreover, the sample names must be matching. This matching process also mean loss of information because we performed sample filtering in the metabolite preprocessing section.
+
+### Variance decomposition
+
+Here are the different objects from the SC analysis using \texttt{sca} function from \texttt{multiblock} package along with a summary of the model (the datatables are scaled for the analysis):
+
+```{r}
+sca.stan <- multiblock::sca(X = list(as.data.frame(MB.stan),
+                                     as.data.frame(VM.stan)),
+                            ncomp = nvar, scale = F,
+                            samplelinked = T)
+sca.umd <- multiblock::sca(X = list(MB.umd, VM.umd), ncomp = nvar, scale = F, samplelinked = T)
+#Summary of SCA model
+summary(sca.stan)
+summary(sca.umd)
+```
+
+Just like PCA, we can inspect the (global) explained variance of the simultaneous components:
+
+```{r, out.width='50%'}
+var.tib.stan <- 
+  tibble(comp = names(sca.stan$explvar),
+         perc.var = sca.stan$explvar/100) |>
+  mutate(cum = cumsum(perc.var))
+var.tib.umd <- 
+  tibble(comp = names(sca.umd$explvar),
+         perc.var = sca.umd$explvar/100) |>
+  mutate(cum = cumsum(perc.var))
+vardecomp(var.tib.stan, cohort = "Stanford", comp.max = 30, col = CohCol["Stanford"])
+vardecomp(var.tib.umd, cohort = "UMD", comp.max = 30, col = CohCol["UMD"])
+```
+
+The first component explains `r var.tib.stan[1,2]*100`% of the variance in Stanford and `r var.tib.umd[1,2]*100`% in UMD; but it requires `r dim(var.tib.stan[var.tib.stan$cum <= 0.75,])[1]+1` components to reach 75% of variance explained in Stanford and `r dim(var.tib.umd[var.tib.umd$cum <= 0.75,])[1]+1` components in UMD. It means the first few components are very good at capturing the variability inside and across datatables.
+
+### Scores
+
+Let us quickly explore the common scores of the SCA model:
+
+```{r}
+#Selecting 10 random subjects
+set.seed(1234)
+subj.stan <- sample(x = unique(MB.SE.stan$Subject), size = 10, replace = FALSE)
+Sampled.stan <- c()
+  for(i in 1:length(MB.SE.stan$Subject)){
+    if(MB.SE.stan$Subject[i] %in% subj.stan){
+      Sampled.stan[i] <- MB.SE.stan$Subject[i]
+    } else{Sampled.stan[i] <- "(other)"}
+  }
+subj.umd <- sample(x = unique(MB.SE.umd$Subject), size = 10, replace = FALSE)
+Sampled.umd <- c()
+  for(i in 1:length(MB.SE.umd$Subject)){
+    if(MB.SE.umd$Subject[i] %in% subj.umd){
+      Sampled.umd[i] <- MB.SE.umd$Subject[i]
+    } else{Sampled.umd[i] <- "(other)"}
+  }
+#Color palette
+palette <- c("grey80", 
+             "#1F77B4", "#FF7F0E", "#2CA02C", "#D62728", "#9467BD",
+             "#8C564B", "#E377C2", "#00BC00", "#BCBD22", "#17BECF")
+```
+```{r, out.width='50%'}
+#Component 1 and 2 scores
+scores.plot(sca.mod = sca.stan, comp = c(1,2), cohort = "Stanford")+
+  aes(col = Sampled.stan)+
+  scale_fill_manual(values = palette, aesthetics = c("colour", "fill"))+
+  labs(col = "Subject")
+
+scores.plot(sca.mod = sca.umd, comp = c(1,2), cohort = "UMD")+
+  aes(col = Sampled.umd)+
+  scale_fill_manual(values = palette, aesthetics = c("colour", "fill"))+
+  labs(col = "Subject")
+
+#Component 3 and 4 scores
+scores.plot(sca.mod = sca.stan, comp = c(3,4), cohort = "Stanford")+
+  aes(col = Sampled.stan)+
+  scale_fill_manual(values = palette, aesthetics = c("colour", "fill"))+
+  labs(col = "Subject")
+scores.plot(sca.mod = sca.umd, comp = c(3,4), cohort = "UMD")+
+  aes(col = Sampled.umd)+
+  scale_fill_manual(values = palette, aesthetics = c("colour", "fill"))+
+  labs(col = "Subject")
+```
+
+
+```{r, out.width='100%'}
+scores.plot(sca.mod = sca.stan, comp = c(1,2), cohort = "Stanford")+
+  aes(col = MB.SE.stan$Prop_Lacto)+
+  labs(col = "Lactobacillus \n proportion")+
+  scale_color_gradient(low = "thistle2", high = "orchid4") +
+scores.plot(sca.mod = sca.umd, comp = c(1,2), cohort = "UMD")+
+  aes(col = MB.SE.umd$Prop_Lacto)+
+  labs(col = "Lactobacillus \n proportion")+
+  scale_color_gradient(low = "thistle2", high = "orchid4") +
+scores.plot(sca.mod = sca.stan, comp = c(3,4), cohort = "Stanford")+
+  aes(col = MB.SE.stan$Prop_Lacto)+
+  labs(col = "Lactobacillus \n proportion")+
+  scale_color_gradient(low = "thistle2", high = "orchid4") +
+scores.plot(sca.mod = sca.umd, comp = c(3,4), cohort = "UMD")+
+  aes(col = MB.SE.umd$Prop_Lacto)+
+  labs(col = "Lactobacillus \n proportion")+
+  scale_color_gradient(low = "thistle2", high = "orchid4") +
+  plot_layout(guides = "collect", axes = "collect", ncol = 2)
+
+rm(i, palette, Sampled.stan, Sampled.umd, subj.stan, subj.umd)
+```
+
+Through the first 4 components, we see a cloud of points centered around $(0,0)$. There are no outlier, nor a general trend.
+
+If we look at the coloring, we can see some subjects for which the data points are closer together, suggesting a small subject effect or within subject correlation.
+
+### Loadings
+
+Let us explore the loadings. First, let us seem them separately for each data block (i.e. for MB and sub-community data) and then visualize them together in correlation circle plot:
+
+```{r}
+loading.plot(sca.mod = sca.stan, comp = c(1,2), palette = Dcol$Stanford, cohort = "Stanford")
+loading.plot(sca.mod = sca.stan, comp = c(3,4), palette = Dcol$Stanford, cohort = "Stanford")
+loading.plot(sca.mod = sca.umd, comp = c(1,2), palette = Dcol$UMD, cohort = "UMD")
+loading.plot(sca.mod = sca.umd, comp = c(3,4), palette = Dcol$UMD, cohort = "UMD")
+```
+
+```{r}
+loads1 <- sca.stan$blockLoadings[[1]]
+loads2 <- sca.stan$blockLoadings[[2]]
+
+data.frame(block = "Metabo",
+               variab = rownames(loads1),
+               loads1) |> tibble() |>
+    mutate(evid = ifelse(variab %in% c("lactate", "tyramine", "putrescine", "spermidine", "cysteine", "hippurate"), variab, NA)) |>
+    mutate(varlab = ifelse(!(variab %in% c("lactate", "tyramine", "putrescine", "spermidine", "cysteine", "hippurate")), variab, NA)) |>
+    ggplot()+
+    geom_segment(aes(xend = Comp.1, yend = Comp.2, x=0,y=0,
+                     col = rowData(MB.SE.stan)$SUPER_PATHWAY), 
+                 arrow = arrow(angle = 12, length = unit(0.3, "cm")))+
+    geom_vline(aes(xintercept = 0),
+               linetype = "dashed", col = "grey60")+
+    geom_hline(aes(yintercept = 0),
+               linetype = "dashed", col = "grey60")+
+    labs(subtitle = "Metabolite colored by Super-pathway")+
+    #ggrepel::geom_text_repel(aes(x = Comp.1, y = Comp.2, label = varlab), box.padding = 0.5, size = 3)+
+    ggrepel::geom_text_repel(aes(x = Comp.1, y = Comp.2, label = evid), box.padding = 0.5, size = 3)+
+    theme(legend.position= "none")
+
+data.frame(block = "Metabo",
+               variab = rownames(loads1),
+               loads1) |> tibble() |>
+    mutate(evid = ifelse(variab %in% c("lactate", "tyramine", "putrescine", "spermidine", "cysteine", "hippurate"), variab, NA)) |>
+    mutate(varlab = ifelse(!(variab %in% c("lactate", "tyramine", "putrescine", "spermidine", "cysteine", "hippurate")), variab, NA)) |>
+    ggplot()+
+    geom_segment(aes(xend = Comp.3, yend = Comp.4, x=0,y=0,
+                     col = rowData(MB.SE.stan)$SUPER_PATHWAY), 
+                 arrow = arrow(angle = 12, length = unit(0.3, "cm")))+
+    geom_vline(aes(xintercept = 0),
+               linetype = "dashed", col = "grey60")+
+    geom_hline(aes(yintercept = 0),
+               linetype = "dashed", col = "grey60")+
+    labs(subtitle = "Metabolite")+
+    #ggrepel::geom_text_repel(aes(x = Comp.1, y = Comp.2, label = varlab), box.padding = 0.5, size = 3)+
+    ggrepel::geom_text_repel(aes(x = Comp.3, y = Comp.4, label = evid), box.padding = 0.5, size = 3)+
+    theme(legend.position= "none")
+
+```
+
+Stanford:
+
+* Metabolites: phosphate is the only metabolite positively correlated to the first principal component. This being said, all other metabolites are either negatively correlated to the first component or weakly correlated. Hippurate, compared to STATIS analysis, does not stand out from the rest of the metabolites.
+
+* Subcommunities: the second component easily discriminates between the textit{Lactobacillus} (positively correlated) and non-textit{Lactobacillus} (negatively correlated) dominated subcommunities, except for CST I which is also negatively correlated to the 2nd component.
+
+* Both: Overall, the first and second dimension clearly show that no metabolite is solely produced by the sub-communities we opted for. Based on first two dimensions, tyramine, putrescine and hippurate seem more likely to be associated with either CST I or IV-B.a than any other subcommunity. But with dimensions 3 and 4, we clearly see hippurate is correlated with CST I, while tyramine and putrescine are correlated to IV-B.b or IV-O.a. Furthermore, adipate is associated with IV-O.b
+
+UMD
+
+* Metabolites: very similar shape and interpretation as Stanford results: phosphate is positively correlated to first dimension. All other metabolites are confounded between each other. Tyramine and putrescine are correlated to one-another
+
+* Subcommunities: The distinction between lactobacilli and non-lactobacilli is obvious using both first and second dimensions and even 3rd dimension. IV-O.a seems independent of IV-O.b. Recurring correlation between IV-B.b and IV-O.a.
+
+* Both: phosphate is probably correlated to IV-O.b; hippurate is correlated to I and maybe other lactobacilli dominated subcommunities; tyramine and putrescine are correlated to IV-B.b and IV-O.a. Lactate is associated with all textit{Lactobacillus}-dominated subcommunities. Cytosine is associated with CST I in 3-4 dimensions
+
+Correlation circle plot
+
+```{r, out.width='50%'}
+corr.plot(sca.mod = sca.stan, comp = c(1,2), palette = Dcol$Stanford, cohort = "Stanford")
+corr.plot(sca.mod = sca.umd, comp = c(1,2), palette = Dcol$UMD, cohort = "UMD")
+#corr.plot(sca.mod = sca.stan, comp = c(3,4), palette = Dcol$Stanford, cohort = "Stanford")
+#corr.plot(sca.mod = sca.umd, comp = c(3,4), palette = Dcol$UMD, cohort = "UMD")
+#multiblock::corrplot(sca.stan, comps = 1:2, labels = F, col = Dcol$Stanford)
+#multiblock::corrplot(sca.umd, comps = 1:2, labels = F, col = Dcol$UMD)
+#multiblock::corrplot(sca.stan, comps = 3:4, labels = F, col = Dcol$Stanford)
+#multiblock::corrplot(sca.umd, comps = 3:4, labels = F, col = Dcol$UMD)
+```
+
+The correlation circle plot is essentially a summary of the previous plots where each dot is a variable plotted on given dimensions. The advantage of the correlation circle is that it standardises the distances so as to make the correlations comparable.
+
+In the first two dimensions, the correlation between MB and sub-community variables seem both sparce and low. However, in dimension 3 and 4, the correlations might be more numerous but still low.
+
+## Canonical correlation analysis
+
+### Theory
+
+Canonical correlation analysis is the analysis of the matrix $U=aX$ and $V=bY$ which maximizes the correlation $\rho = corr(U,V)$ such that:
+
+$$\arg \max_{a,b} corr(aX,bY)$$
+
+, where $X$ is $(n\times p)$ and $Y$ is $(n \times q)$. Basically, we look for coefficients $a=(a_1, a_2,...,a_p)$ and $b=(b_1, b_2,..., b_q)$ to form linear combinations $U=aX$ and $V=bY$ of the variables of the two datasets $X$ and $Y$ which maximize a given correlation measure between the two response $U$ and $V$, also named _variates_. There are different correlation measures/ coefficients and one most used is the RV coefficient.
+
+Furthermore, CCA can try and find more than one couple of linear combinations $U_1$ and $V_1$; it can also look for additionnal variates $U_k$ and $V_k$ which also maximize the correlation $\rho_k$. These new variates can be constrained to be perpendicular to the previous computed variates.
+
+The CCA model relies on the assumption of linear relationship between the variables of the datasets.
+
+Issues if the data has more variables than observations. Even though omics data analyses involves high-throughput datasets with the number of variables `p` usually greater than the number of observations `n`, the canonical correlation analysis relies on datasets with dimensions $n \times p$ where $n > p$.
+
+Therefore, we need overcome this obstacle:
+
+* whether by selecting variables prior to cca
+
+* or by using more elaborate techniques such as the ones used by `mixOmics`'s Bioconductor's package
+
+*Variable selection prior to CCA*
+
+From the metabolite preprocessing, we filtered some columns, therefore the dimensions of the datasets are correct for CCA. No additionnal variable selection is needed. We note that for another filter threshold, one might need to make variable selection prior to CCA.
+
+For the compositional datasets we need to be more careful. Since the compositional data describes the proportion of topics (in columns) for each sample (in rows), the row-wise sum is always 100%. In that case, the row-wise value of any one-column $x_{iJ}$ can be calculated based on the values of the remaining columns such that $x_{iJ}= 1- \sum_{j=1}^{J-1} x_{ij}$. Therefore, there will always be one too many variable in the compositional block.
+
+The question now is "which variable to discard"? Since its information can be derived from the other variables, then one could simply choose at random. Or, one might be interested some topics more than others. For example, topics I, II, III, V and VI are all lactobacilli dominant topics and were defined deliberately. Furthermore, topic IV-O.a and IV-O.b are not very well defined topics, with IV-O.b being the topic corresponding to all species that did not belong in any other ones. Therefore, we are tempted to discard variable \emph{IV-0.b} for proceed with the analysis.
+
+### Canonical correlations
+
+And now, a standard CCA can be applied using `cancor()` or `CCA::cc()` functions (in this case, the cc() function is based on cancor and offers more results, thus, we use cc()) (see [ref](https://stats.oarc.ucla.edu/r/dae/canonical-correlation-analysis/) for more information on CCA):
+
+```{r}
+#Renaming
+X.stan <- MB.stan
+Y.stan <- VM.stan[,colnames(VM.stan)!="IV-O.b"]
+cca.stan <- CCA::cc(X = X.stan, Y = Y.stan) #the last column has the least overall percentage --> it practically explains nothing
+X.umd <- MB.umd
+Y.umd <- VM.umd[,colnames(VM.umd)!="IV-O.b"]
+cca.umd <- CCA::cc(X = X.umd, Y = Y.umd)
+```
+
+Let's explore the canonical correlations between the metabolite and sub-community datasets.
+
+```{r, out.width='50%'}
+CcaBarplot(cca.stan$cor, cohort = "Stanford", col = CohCol["Stanford"])
+CcaBarplot(cca.umd$cor, cohort = "UMD", col = CohCol["UMD"])
+```
+
+All canonical correlations $\rho$ are very high (greater than 90%) which means the algorithm was able to find good linear combinations of the variables.
+
+### Loadings
+
+Next, we’ll use `comput` to compute the loadings of the variables on the canonical dimensions (variates). These loadings are correlations between variables and the canonical variates.
+
+```{r}
+cca.loads(cca.stan, palette = Dcol$Stanford, cohort = "Stanford")
+cca.loads(cca.stan, palette = Dcol$Stanford, cohort = "Stanford", comp = c(3,4))
+cca.loads(cca.umd, palette = Dcol$UMD, cohort = "UMD")
+cca.loads(cca.umd, palette = Dcol$UMD, cohort = "UMD", comp = c(3,4))
+```
+
+The previous plots show the contribution of each variable to the variates of their corresponding block. It is important to realize that, for example, _variate 1_ of metabolites is not the same as _variate 1_ of subcommunities. These two "variate 1" are just highly correlated with one-another.
+
+A naive and simple interpretation of the previous plots could mention that:
+
+* For Stanford, 1) hippurate and ornithine could be associated with subcommunity I; 2) tyramine and putrescine could be associated with IV-O.a; 3) Methionine could be associated with II
+
+* For UMD, 1) Putrescine and tyramine could be associated with IV-O.a; 2) Orotate could be associated with I; 3) Xanthine could be associated with IV-B.b.
+
+One can further these interpretation by focusing on the 8 most contributing variables, in absolute value, of variate 1 for instance. Here are the results:
+
+```{r}
+##### STANFORD - VARIATE 1
+rbind(
+  data.frame(block = "Metabolites",
+             cca.stan$scores$corr.X.yscores,
+             variab = rownames(cca.stan$scores$corr.X.yscores)) |> 
+    tibble(),
+  data.frame(block = "Sub-community",
+             cca.stan$scores$corr.Y.xscores,
+             variab = rownames(cca.stan$scores$corr.Y.xscores)) |> 
+    tibble()
+  ) |>
+  group_by(block) |>
+  mutate(Abs = abs(X1)) |>
+  top_n(Abs, n = 8) |>
+  dplyr::select(X1, Abs, variab) |> arrange(block, X1) |>
+  pander(caption = "Stanford's 8 most contributing metabolites to variate 1")
+
+
+##### UMD
+rbind(
+  data.frame(block = "Metabolites",
+             cca.umd$scores$corr.X.yscores,
+             variab = rownames(cca.umd$scores$corr.X.yscores)) |> 
+    tibble(),
+  data.frame(block = "Sub-community",
+             cca.umd$scores$corr.Y.xscores,
+             variab = rownames(cca.umd$scores$corr.Y.xscores)) |> 
+    tibble()
+  ) |>
+  group_by(block) |>
+  mutate(Abs = abs(X1)) |>
+  top_n(Abs, n = 8) |>
+  dplyr::select(X1, Abs, variab) |> arrange(block, X1) |>
+  pander(caption = "UMD's 8 most contributing metabolites to variate 1")
+```
+
+For Stanford:
+
+* Asparagine is the most contributing metabolite: when asparagine avarage levels increase, one expects the sub-community V to become more predominant, and the sub-community IV-O.a to decrease in population
+
+* Hippurate is amongst the 8 most contributing metabolites: when the average levels of hippurate increase, one expects the proportion of sub-community I to increase.
+
+For UMD:
+
+* Let us talk about putrescine: when the average levels of putrescine increase, one expects the proportion of IV-O.a to increase as well
+
+* When the average levels of hippurate and lactate increase, one expects the general population of textit{Lactobacillus} to increase.
+
+One could repeat such a procedure with the other variates.
+
+In general, the number of canonical dimensions is equal to the number of variables in the smaller set; however, the number of _significant_ dimensions may be even smaller. One can test this significance using with texttt{CCP::p.asym()} function. We specify the function to use Wilks' Lambda for this asymptotic test' statistics. The test is implemented in such a way that: "the first p-value is calculated including all canonical correlation coefficients, the second p-value is calculated by excluding $\rho_1$, the third p-value is calculated by excluding $\rho_1$ and $\rho_2$ etc., therewith allowing assessment of the statistical significance of each individual correlation coefficient" [url](https://cran.r-project.org/web/packages/CCP/CCP.pdf) [d](@Manual{,
+    title = {CCP: Significance Tests for Canonical Correlation Analysis (CCA)}, author = {Uwe Menzel},year = {2022}, note = {R package version 1.2}, url = {https://CRAN.R-project.org/package=CCP},
+  })
+  
+Therefore, the tests hypothesis are:
+
+$[H_{0,j}: \rho_j=\rho_{j+1} =... = \rho_J = 0]_{j=1,...,J}$
+
+$[H_{1,j}: \exists\ l\ \text{s.t.}\ \rho_l>0]_{j=1,...,J}$
+
+```{r}
+## Calculate p-values using the F-approximations of different test statistics:
+p.asym(rho = cca.stan$cor,
+       N = nrow(X.stan),
+       p = ncol(X.stan),
+       q = ncol(Y.stan),
+       tstat = "Wilks")
+p.asym(rho = cca.umd$cor,
+       N = nrow(X.umd),
+       p = ncol(X.umd),
+       q = ncol(Y.umd),
+       tstat = "Wilks")
+```
+
+From the previous tables, we can simply say that all Stanford's canonical correlations are significantly greater than 0, using a threshold of 5%, except for the last canonical correlation. However, all UMD's canonical correlations are significant.
+
+## PCA on left-joined table
+
+```{r, out.width='50%', eval = F}
+Comb <- cbind(MB.stan, VM.stan)
+dim(Comb)
+sum(apply(Comb, 2, FUN=sd))
+PCA <- multiblock::pca(X = as.matrix(Comb), scale = F, ncomp = 50)
+PCA$loadings[,1:2] |> plot(col = as.factor(c(rep("MB", 132), rep("VM", 10))))
+PCA$explvar |> barplot()
+PCA$scores|>plot()
+```
+
+So basically, the SCA function performs a principle component regression with a response variable y based on a random variable `rnorm(nrow(X), mean = 0, sd = 1)`. This PCR is performed by the function `pls::pcr(y ~ X)` where `X` is the input matrix (a combination of all common-row data blocks)
+
+## Manual SCA
+
+```{r, out.width='50%', eval = F}
+Smb <- as.matrix(MB.stan) %*% t(as.matrix(MB.stan))
+Ssc <- as.matrix(VM.stan) %*% t(as.matrix(VM.stan))
+
+C <- Smb + Ssc
+dim(C)
+PCA <- FactoMineR::PCA(X = C, scale = FALSE, graph = F)
+fviz_eig(PCA, ncp = 30)
+fviz_pca_ind(PCA, axes = c(1,2), label = "none")
+Score <- PCA$ind$coord
+
+LoadM <- t(MB.stan) %*% Score
+LoadS <- t(VM.stan) %*% Score
+ggplot()+
+  geom_segment(aes(xend = LoadS[,1], yend = LoadS[,2],
+                   x = 0, y = 0))
+ggplot()+
+  geom_segment(aes(xend = LoadM[,1], yend = LoadM[,2],
+                   x = 0, y = 0))
+```
+```{r, out.width='50%', eval = F}
+#STATIS
+
+C <- (statis.stan$RV.eig[1])*Smb + (statis.stan$RV.eig[2])*Ssc
+dim(C)
+
+PCA <- FactoMineR::PCA(X = C, scale = FALSE, graph = F)
+fviz_eig(PCA, ncp = 30)
+fviz_pca_ind(PCA, axes = c(1,2), label = "none")
+Score <- PCA$ind$coord
+
+LoadM <- t(MB.stan) %*% Score
+LoadS <- t(VM.stan) %*% Score
+ggplot()+
+  geom_segment(aes(xend = LoadS[,1], yend = LoadS[,2],
+                   x = 0, y = 0))
+ggplot()+
+  geom_segment(aes(xend = LoadM[,1], yend = LoadM[,2],
+                   x = 0, y = 0))
+```
+
+```{r, out.width='50%', eval = F}
+Smb <- as.matrix(MB.umd) %*% t(as.matrix(MB.umd))
+Ssc <- as.matrix(VM.umd) %*% t(as.matrix(VM.umd))
+
+C <- Smb + Ssc
+dim(C)
+PCA <- FactoMineR::PCA(X = C, scale = FALSE, graph = F)
+fviz_eig(PCA, ncp = 30)
+fviz_pca_ind(PCA, axes = c(1,2), label = "none")
+Score <- PCA$ind$coord
+
+LoadM <- t(MB.umd) %*% Score
+LoadS <- t(VM.umd) %*% Score
+ggplot()+
+  geom_segment(aes(xend = LoadS[,1], yend = LoadS[,2],
+                   x = 0, y = 0))
+ggplot()+
+  geom_segment(aes(xend = LoadM[,1], yend = LoadM[,2],
+                   x = 0, y = 0))
+```
+
